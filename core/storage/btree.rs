@@ -9659,6 +9659,7 @@ mod tests {
                 buffer_pool,
                 Arc::new(crate::sync::Mutex::new(())),
                 init_page_1,
+                None,
             )
             .unwrap(),
         );

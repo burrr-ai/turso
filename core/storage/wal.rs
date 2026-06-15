@@ -70,6 +70,7 @@ pub struct CheckpointResult {
     pub wal_truncate_sent: bool,
     /// Whether WAL sync I/O has been submitted after truncation
     pub wal_sync_sent: bool,
+    pub(crate) checkpoint_observer_sent: bool,
 }
 
 impl Drop for CheckpointResult {
@@ -93,6 +94,7 @@ impl CheckpointResult {
             db_truncate_sent: false,
             wal_truncate_sent: false,
             wal_sync_sent: false,
+            checkpoint_observer_sent: false,
         }
     }
 
@@ -5548,8 +5550,9 @@ pub mod test {
         },
         types::IOResult,
         util::IOExt,
-        Buffer, CheckpointMode, CheckpointResult, Completion, CompletionError, Connection,
-        Database, File, LimboError, MemoryIO, OpenFlags, PlatformIO, SyncMode, WalFileShared, IO,
+        Buffer, CheckpointMode, CheckpointObserver, CheckpointResult, Completion, CompletionError,
+        Connection, Database, DatabaseOpts, File, LimboError, MemoryIO, OpenFlags, PlatformIO,
+        SyncMode, WalFileShared, IO,
     };
     use std::num::NonZeroUsize;
     #[cfg(unix)]
@@ -5571,6 +5574,11 @@ pub mod test {
 
     #[allow(clippy::arc_with_non_send_sync)]
     pub(crate) fn get_database() -> (Arc<Database>, std::path::PathBuf) {
+        get_database_with_opts(crate::DatabaseOpts::new().with_multiprocess_wal(true))
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn get_database_with_opts(opts: DatabaseOpts) -> (Arc<Database>, std::path::PathBuf) {
         let mut path = tempfile::tempdir().unwrap().keep();
         let dbpath = path.clone();
         path.push("test.db");
@@ -5585,12 +5593,73 @@ pub mod test {
             io.clone(),
             path.to_str().unwrap(),
             crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_multiprocess_wal(true),
+            opts,
             None,
         )
         .unwrap();
         // db + tmp directory
         (db, dbpath)
+    }
+
+    #[derive(Debug, Clone)]
+    struct ObservedCheckpoint {
+        mode: CheckpointMode,
+        wal_max_frame: u64,
+        wal_total_backfilled: u64,
+        wal_checkpoint_backfilled: u64,
+        db_sync_sent: bool,
+        wal_truncate_sent: bool,
+        nbackfills_at_observe: u64,
+    }
+
+    #[derive(Debug)]
+    struct RecordingCheckpointObserver {
+        shared_wal: Mutex<Option<Arc<RwLock<WalFileShared>>>>,
+        observed: Mutex<Vec<ObservedCheckpoint>>,
+    }
+
+    impl RecordingCheckpointObserver {
+        fn new() -> Self {
+            Self {
+                shared_wal: Mutex::new(None),
+                observed: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn set_shared_wal(&self, shared_wal: Arc<RwLock<WalFileShared>>) {
+            *self.shared_wal.lock() = Some(shared_wal);
+        }
+
+        fn observed(&self) -> Vec<ObservedCheckpoint> {
+            self.observed.lock().clone()
+        }
+    }
+
+    impl CheckpointObserver for RecordingCheckpointObserver {
+        fn checkpoint_synced(
+            &self,
+            mode: CheckpointMode,
+            result: &CheckpointResult,
+        ) -> crate::Result<()> {
+            self.observed.lock().push(ObservedCheckpoint {
+                mode,
+                wal_max_frame: result.wal_max_frame,
+                wal_total_backfilled: result.wal_total_backfilled,
+                wal_checkpoint_backfilled: result.wal_checkpoint_backfilled,
+                db_sync_sent: result.db_sync_sent,
+                wal_truncate_sent: result.wal_truncate_sent,
+                nbackfills_at_observe: self
+                    .shared_wal
+                    .lock()
+                    .as_ref()
+                    .expect("shared WAL should be installed before checkpoint")
+                    .read()
+                    .metadata
+                    .nbackfills
+                    .load(Ordering::SeqCst),
+            });
+            Ok(())
+        }
     }
 
     struct DeferredReadFile {
@@ -5843,6 +5912,101 @@ pub mod test {
             0,
             "SyncMode::Off must not publish positive nbackfills as durable shared state"
         );
+    }
+
+    #[test]
+    fn test_checkpoint_observer_runs_after_db_sync_before_backfill_publish() {
+        let observer = Arc::new(RecordingCheckpointObserver::new());
+        let db = get_database().0;
+        db.set_checkpoint_observer(Some(observer.clone()));
+        let wal_shared = db.shared_wal.clone();
+        observer.set_shared_wal(wal_shared.clone());
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 8, 2);
+
+        let pager = conn.pager.load();
+        let result = run_checkpoint_until_done(&pager, CheckpointMode::Full);
+        assert!(
+            result.wal_total_backfilled > 0,
+            "checkpoint setup should backfill frames"
+        );
+
+        let observed = observer.observed();
+        assert_eq!(observed.len(), 1);
+        let event = &observed[0];
+        assert_eq!(event.mode, CheckpointMode::Full);
+        assert_eq!(event.wal_max_frame, result.wal_max_frame);
+        assert_eq!(event.wal_total_backfilled, result.wal_total_backfilled);
+        assert_eq!(
+            event.wal_checkpoint_backfilled,
+            result.wal_checkpoint_backfilled
+        );
+        assert!(event.db_sync_sent);
+        assert!(!event.wal_truncate_sent);
+        assert_eq!(
+            event.nbackfills_at_observe, 0,
+            "observer should run after DB sync but before internal backfill publication"
+        );
+        assert_eq!(
+            wal_shared.read().metadata.nbackfills.load(Ordering::SeqCst),
+            result.wal_total_backfilled,
+            "checkpoint should publish Turso backfill after observer succeeds"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_observer_runs_for_truncate_before_wal_truncate() {
+        let observer = Arc::new(RecordingCheckpointObserver::new());
+        let db = get_database().0;
+        db.set_checkpoint_observer(Some(observer.clone()));
+        observer.set_shared_wal(db.shared_wal.clone());
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 8, 2);
+
+        let pager = conn.pager.load();
+        let _ = run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+
+        let observed = observer.observed();
+        assert_eq!(observed.len(), 1);
+        let event = &observed[0];
+        assert_eq!(
+            event.mode,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None
+            }
+        );
+        assert!(event.wal_total_backfilled > 0);
+        assert!(event.db_sync_sent);
+        assert!(!event.wal_truncate_sent);
+    }
+
+    #[test]
+    fn test_checkpoint_observer_not_called_when_sync_mode_off() {
+        let observer = Arc::new(RecordingCheckpointObserver::new());
+        let db = get_database().0;
+        db.set_checkpoint_observer(Some(observer.clone()));
+        observer.set_shared_wal(db.shared_wal.clone());
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 8, 2);
+
+        let pager = conn.pager.load();
+        let result = pager
+            .io
+            .block(|| pager.checkpoint(CheckpointMode::Full, SyncMode::Off, true))
+            .unwrap();
+        assert!(result.wal_total_backfilled > 0);
+        assert!(observer.observed().is_empty());
     }
 
     fn make_test_wal() -> (Arc<RwLock<WalFileShared>>, WalFile) {

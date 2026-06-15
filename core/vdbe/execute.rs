@@ -11994,6 +11994,7 @@ pub fn op_open_ephemeral(
                 buffer_pool,
                 Arc::new(Mutex::new(())),
                 ephemeral_init_page_1,
+                None,
             )?);
 
             pager.set_page_size(page_size);

@@ -194,6 +194,14 @@ pub const fn is_attached_db(database_id: usize) -> bool {
     database_id >= FIRST_ATTACHED_DB_ID
 }
 
+pub trait CheckpointObserver: fmt::Debug + Send + Sync {
+    fn checkpoint_synced(
+        &self,
+        mode: storage::wal::CheckpointMode,
+        result: &storage::wal::CheckpointResult,
+    ) -> Result<()>;
+}
+
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
@@ -502,6 +510,7 @@ pub struct Database {
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
+    checkpoint_observer: RwLock<Option<Arc<dyn CheckpointObserver>>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -565,6 +574,10 @@ impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
+    }
+
+    pub fn set_checkpoint_observer(&self, observer: Option<Arc<dyn CheckpointObserver>>) {
+        *self.checkpoint_observer.write() = observer;
     }
 
     fn new(
@@ -632,6 +645,7 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
+            checkpoint_observer: RwLock::new(None),
 
             durable_storage: None,
         };
@@ -2267,6 +2281,7 @@ impl Database {
             buffer_pool,
             self.init_lock.clone(),
             self.init_page_1.clone(),
+            self.checkpoint_observer.read().clone(),
         )?;
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {

@@ -24,8 +24,8 @@ use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
-    io::CompletionGroup, return_if_io, types::WalFrameInfo, Completion, Connection, IOResult,
-    LimboError, Result, TransactionState,
+    io::CompletionGroup, return_if_io, types::WalFrameInfo, CheckpointObserver, Completion,
+    Connection, IOResult, LimboError, Result, TransactionState,
 };
 use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
 #[allow(unused_imports)]
@@ -1374,6 +1374,7 @@ pub struct Pager {
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
     sync_type: AtomicFileSyncType,
+    checkpoint_observer: Option<Arc<dyn CheckpointObserver>>,
 }
 
 assert_send_sync!(Pager);
@@ -1493,6 +1494,7 @@ impl Pager {
         buffer_pool: Arc<BufferPool>,
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
+        checkpoint_observer: Option<Arc<dyn CheckpointObserver>>,
     ) -> Result<Self> {
         let allocate_page1_state = if init_page_1.load().is_some() {
             RwLock::new(AllocatePage1State::Start)
@@ -1542,6 +1544,7 @@ impl Pager {
             init_page_1,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
+            checkpoint_observer,
         })
     }
 
@@ -4063,6 +4066,44 @@ impl Pager {
         state.lock_source = CheckpointLockSource::Acquire;
     }
 
+    fn notify_checkpoint_observer_if_needed(&self) -> Result<()> {
+        let Some(observer) = &self.checkpoint_observer else {
+            return Ok(());
+        };
+        let Some((mode, observable_result)) = ({
+            let state = self.checkpoint_state.read();
+            let result = state.result.as_ref().expect("result should be set");
+            if result.checkpoint_observer_sent || result.wal_checkpoint_backfilled == 0 {
+                None
+            } else {
+                let mut observable_result = CheckpointResult::new(
+                    result.wal_max_frame,
+                    result.wal_total_backfilled,
+                    result.wal_checkpoint_backfilled,
+                );
+                observable_result.db_truncate_sent = result.db_truncate_sent;
+                observable_result.db_sync_sent = result.db_sync_sent;
+                observable_result.wal_truncate_sent = result.wal_truncate_sent;
+                observable_result.wal_sync_sent = result.wal_sync_sent;
+                Some((
+                    state.mode.expect("checkpoint mode should be set"),
+                    observable_result,
+                ))
+            }
+        }) else {
+            return Ok(());
+        };
+
+        observer.checkpoint_synced(mode, &observable_result)?;
+        self.checkpoint_state
+            .write()
+            .result
+            .as_mut()
+            .expect("result should be set")
+            .checkpoint_observer_sent = true;
+        Ok(())
+    }
+
     /// Clean up after a auto-checkpoint failure.
     /// Auto-checkpoint executed outside of the main transaction - so WAL transaction was already finalized
     pub fn cleanup_after_auto_checkpoint_failure(&self) {
@@ -4295,6 +4336,7 @@ impl Pager {
                             !self.syncing.load(Ordering::SeqCst),
                             "syncing should be done"
                         );
+                        self.notify_checkpoint_observer_if_needed()?;
                         self.checkpoint_state.write().phase =
                             self.next_post_sync_checkpoint_phase(clear_page_cache);
                         continue;
@@ -5527,6 +5569,7 @@ mod ptrmap_tests {
             buffer_pool,
             Arc::new(Mutex::new(())),
             init_page_1,
+            None,
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();
@@ -5587,6 +5630,7 @@ mod ptrmap_tests {
             buffer_pool,
             Arc::new(Mutex::new(())),
             Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+            None,
         )
         .unwrap();
 
