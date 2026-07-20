@@ -110,7 +110,9 @@ use std::{
 use storage::database::DatabaseFile;
 #[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
-use storage::{page_cache::PageCache, sqlite3_ondisk::PageSize};
+use storage::{
+    page_cache::PageCache, shared_page_cache::SharedPageCacheNamespace, sqlite3_ondisk::PageSize,
+};
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::{ast, ast::Cmd, parser::Parser};
@@ -137,6 +139,9 @@ pub use io::{
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{Statement, StatementStatusCounter};
+pub use storage::shared_page_cache::{
+    SharedPageCache, SharedPageCacheLookup, SharedPageCacheObserver, SharedPageCacheStats,
+};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},
@@ -485,9 +490,8 @@ pub struct Database {
     wal_path: String,
     pub io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
-    // Shared structures of a Database are the parts that are common to multiple threads that might
-    // create DB connections.
-    _shared_page_cache: Arc<RwLock<PageCache>>,
+    /// Optional immutable page-byte cache used by future connection pagers.
+    shared_page_cache: RwLock<Option<SharedPageCacheNamespace>>,
 
     /// Optional per-database MVCC durable storage override.
     ///
@@ -553,12 +557,11 @@ impl fmt::Debug for Database {
         };
         debug_struct.field("wal_state", &wal_status);
 
-        // Page cache info (just basic stats, not full contents)
-        let cache_info = match self._shared_page_cache.try_read() {
-            Some(cache) => format!("( capacity {}, used: {} )", cache.capacity(), cache.len()),
-            None => "locked".to_string(),
-        };
-        debug_struct.field("page_cache", &cache_info);
+        let shared_page_cache = self
+            .shared_page_cache
+            .try_read()
+            .map(|cache| cache.is_some());
+        debug_struct.field("shared_page_cache", &shared_page_cache);
 
         debug_struct.field(
             "n_connections",
@@ -580,6 +583,14 @@ impl Database {
         *self.checkpoint_observer.write() = observer;
     }
 
+    /// Configure an immutable page-byte cache for pagers created by future connections.
+    ///
+    /// Existing connections keep their current pager. Callers should configure this immediately
+    /// after opening the database and before accepting connection requests.
+    pub fn set_shared_page_cache(&self, cache: Option<Arc<SharedPageCache>>) {
+        *self.shared_page_cache.write() = cache.map(|cache| cache.new_namespace());
+    }
+
     fn new(
         opts: DatabaseOpts,
         flags: OpenFlags,
@@ -596,7 +607,6 @@ impl Database {
 
         let db_size = db_file.size()?;
 
-        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
         let syms = SymbolTable::new();
         let arena_size = if std::env::var("TESTING").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
             BufferPool::TEST_ARENA_SIZE
@@ -627,7 +637,7 @@ impl Database {
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),
-            _shared_page_cache: shared_page_cache,
+            shared_page_cache: RwLock::new(None),
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
@@ -2273,7 +2283,7 @@ impl Database {
             None
         };
 
-        let pager = Pager::new(
+        let pager = Pager::new_with_shared_page_cache(
             self.db_file.clone(),
             pager_wal,
             self.io.clone(),
@@ -2282,6 +2292,7 @@ impl Database {
             self.init_lock.clone(),
             self.init_page_1.clone(),
             self.checkpoint_observer.read().clone(),
+            self.shared_page_cache.read().clone(),
         )?;
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
