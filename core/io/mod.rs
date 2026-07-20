@@ -537,7 +537,10 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         let len = self.len();
         if let Self::Heap(buf) = self {
-            TEMP_BUFFER_CACHE.with(|cache| {
+            // A Buffer can be owned by another thread-local value. During
+            // thread teardown that owner may be dropped after this cache, in
+            // which case `with` would panic and abort the process.
+            let _ = TEMP_BUFFER_CACHE.try_with(|cache| {
                 let mut cache = cache.borrow_mut();
                 // take ownership of the buffer by swapping it with a dummy
                 let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
@@ -630,6 +633,27 @@ impl Buffer {
 crate::thread::thread_local! {
     /// thread local cache to re-use temporary buffers to prevent churn when pool overflows
     pub static TEMP_BUFFER_CACHE: RefCell<TempBufferCache> = RefCell::new(TempBufferCache::new());
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+
+    std::thread_local! {
+        static BUFFER_DROPPED_DURING_THREAD_EXIT: RefCell<Option<Buffer>> =
+            const { RefCell::new(None) };
+    }
+
+    #[test]
+    fn heap_buffer_drop_tolerates_thread_local_teardown_order() {
+        std::thread::spawn(|| {
+            BUFFER_DROPPED_DURING_THREAD_EXIT.with(|slot| {
+                slot.replace(Some(Buffer::new_temporary(4_096)));
+            });
+        })
+        .join()
+        .expect("buffer drop must not panic during thread-local teardown");
+    }
 }
 
 /// A cache for temporary or any additional `Buffer` allocations beyond
