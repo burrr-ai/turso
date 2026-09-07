@@ -3070,7 +3070,7 @@ impl Pager {
         if buffer.len() != bytes.len() {
             return None;
         }
-        buffer.as_mut_slice().copy_from_slice(&bytes);
+        buffer.as_mut_slice().copy_from_slice(bytes.as_ref());
         let page = Arc::new(Page::new(page_idx));
         sqlite3_ondisk::finish_read_page(page_idx as usize, Arc::new(buffer), page.clone());
         if let ResolvedPageSource::Wal {

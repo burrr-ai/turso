@@ -140,7 +140,9 @@ pub use io::{
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{Statement, StatementStatusCounter};
 pub use storage::shared_page_cache::{
-    SharedPageCache, SharedPageCacheLookup, SharedPageCacheObserver, SharedPageCacheStats,
+    SharedPageCache, SharedPageCacheAccounting, SharedPageCacheCharge, SharedPageCacheChargeKind,
+    SharedPageCacheChargeState, SharedPageCacheCreateError, SharedPageCacheLookup,
+    SharedPageCacheObserver, SharedPageCacheStats,
 };
 pub use storage::{
     buffer_pool::BufferPool,
