@@ -565,6 +565,33 @@ impl AccountedCacheShard {
         true
     }
 
+    fn reclaim_unreferenced(&mut self, target_bytes: usize) -> usize {
+        let entries_to_scan = self.entries.len();
+        let mut reclaimed_bytes = 0_usize;
+        for _ in 0..entries_to_scan {
+            if reclaimed_bytes >= target_bytes {
+                break;
+            }
+            let Some((key, value)) = self.entries.peek_lru() else {
+                break;
+            };
+            let key = *key;
+            if Arc::strong_count(value) == 1 {
+                let Some((removed_key, removed_value)) = self.entries.pop_lru() else {
+                    break;
+                };
+                let charge_bytes = removed_value.reservation.charge.bytes;
+                self.retire_entry(removed_key, removed_value, true);
+                reclaimed_bytes = reclaimed_bytes.saturating_add(charge_bytes);
+            } else {
+                // Advance past an externally referenced allocation without allocating an
+                // inventory snapshot. A complete scan restores the relative order of survivors.
+                self.entries.promote(&key);
+            }
+        }
+        reclaimed_bytes
+    }
+
     fn insert(
         &mut self,
         key: SharedPageKey,
@@ -808,6 +835,34 @@ impl SharedPageCache {
             }
         }
         stats
+    }
+
+    /// Retires accounted clean-page allocations that have no external reader.
+    ///
+    /// At most the entries present at the start of each bounded shard scan are inspected. The
+    /// method performs no I/O or payload allocation, and legacy caches are unchanged. Returned
+    /// bytes are the page allocation charges whose final cache-owned references were released;
+    /// callers must still retry their own admission instead of treating this value as credit.
+    pub fn reclaim_unreferenced(&self, target_bytes: usize) -> usize {
+        if target_bytes == 0 {
+            return 0;
+        }
+        let CacheShards::Accounted(shards) = &self.shards else {
+            return 0;
+        };
+        let mut reclaimed_bytes = 0_usize;
+        for slot in shards.iter().take(self.active_shard_count()) {
+            if reclaimed_bytes >= target_bytes {
+                break;
+            }
+            let AccountedShardSlot::Active(shard) = slot else {
+                unreachable!("active accounted shard range contains only active slots");
+            };
+            let remaining = target_bytes.saturating_sub(reclaimed_bytes);
+            reclaimed_bytes =
+                reclaimed_bytes.saturating_add(shard.lock().reclaim_unreferenced(remaining));
+        }
+        reclaimed_bytes
     }
 
     pub(crate) fn new_namespace(self: &Arc<Self>) -> SharedPageCacheNamespace {
@@ -1146,6 +1201,53 @@ mod tests {
         assert_eq!(accounting.used.load(StdOrdering::Relaxed), 0);
         assert_eq!(accounting.retired.load(StdOrdering::Relaxed), 0);
         assert_eq!(accounting.page_release_calls.load(StdOrdering::Relaxed), 2);
+    }
+
+    #[test]
+    fn reclaim_releases_only_cache_owned_accounted_pages() {
+        let page_size = 256;
+        let max_entries = NonZeroUsize::new(3).expect("three is non-zero");
+        let capacity = one_shard_capacity(page_size, max_entries.get());
+        let metadata = metadata_charge_bytes(capacity, max_entries).expect("metadata charge");
+        let page_charge = page_charge_bytes(page_size).expect("page charge");
+        let accounting = Arc::new(TestAccounting::with_limit(metadata + page_charge * 3));
+        let cache = Arc::new(
+            SharedPageCache::try_with_accounting(capacity, max_entries, accounting.clone(), None)
+                .expect("metadata admission succeeds"),
+        );
+        let namespace = cache.new_namespace();
+        for page_id in 1..=3 {
+            namespace
+                .publisher(page_id, page_size as u32, version(page_id as u64))
+                .publish(&vec![page_id as u8; page_size]);
+        }
+        let held = namespace
+            .get(1, page_size as u32, version(1))
+            .expect("oldest page remains readable");
+
+        assert_eq!(cache.reclaim_unreferenced(page_charge * 2), page_charge * 2);
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(
+            accounting.used.load(StdOrdering::Relaxed),
+            metadata + page_charge
+        );
+        assert_eq!(held.as_ref(), &[1; 256]);
+        assert_eq!(cache.reclaim_unreferenced(page_charge), 0);
+
+        drop(held);
+        assert_eq!(cache.reclaim_unreferenced(page_charge), page_charge);
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(accounting.used.load(StdOrdering::Relaxed), metadata);
+    }
+
+    #[test]
+    fn reclaim_is_opt_in_for_legacy_cache() {
+        let cache = Arc::new(SharedPageCache::new(1024));
+        let namespace = cache.new_namespace();
+        namespace.publisher(1, 256, version(1)).publish(&[7; 256]);
+
+        assert_eq!(cache.reclaim_unreferenced(usize::MAX), 0);
+        assert_eq!(cache.stats().entries, 1);
     }
 
     #[test]
