@@ -49,6 +49,17 @@ pub enum SharedPageCacheChargeState {
     Retired,
 }
 
+/// Result of an opt-in shared-page reservation attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedPageCacheReservation {
+    /// The callback charged the requested allocation.
+    Reserved,
+    /// The callback has insufficient capacity; bounded local reclaim may make progress.
+    CapacityDenied,
+    /// The callback cannot decide now; insertion is skipped without reclaiming entries.
+    Deferred,
+}
+
 /// Admission and lifetime callbacks for opt-in shared-page accounting.
 ///
 /// Implementations must be short, synchronous, non-allocating and must not panic. They must not
@@ -58,6 +69,20 @@ pub enum SharedPageCacheChargeState {
 /// run on any thread that drops the last page handle.
 pub trait SharedPageCacheAccounting: Send + Sync {
     fn try_reserve(&self, charge: SharedPageCacheCharge) -> bool;
+
+    /// Attempts a reservation while distinguishing capacity from transient suppression.
+    ///
+    /// For compatibility, the default maps a `false` boolean reservation to capacity pressure.
+    /// Implementations that can be transiently unable to reserve should override this method and
+    /// return [`SharedPageCacheReservation::Deferred`]. A deferred page is bypassed without cache
+    /// mutation; a later publisher call may retry, but the cache does not schedule retries itself.
+    fn try_reserve_classified(&self, charge: SharedPageCacheCharge) -> SharedPageCacheReservation {
+        if self.try_reserve(charge) {
+            SharedPageCacheReservation::Reserved
+        } else {
+            SharedPageCacheReservation::CapacityDenied
+        }
+    }
 
     fn transition(
         &self,
@@ -83,6 +108,12 @@ struct Reservation {
     state: AtomicU8,
 }
 
+enum ReservationAttempt {
+    Reserved(Reservation),
+    CapacityDenied,
+    Deferred,
+}
+
 impl Reservation {
     fn try_new(
         accounting: Arc<dyn SharedPageCacheAccounting>,
@@ -93,6 +124,21 @@ impl Reservation {
             charge,
             state: AtomicU8::new(RESERVATION_STATE_RESERVED),
         })
+    }
+
+    fn try_new_classified(
+        accounting: Arc<dyn SharedPageCacheAccounting>,
+        charge: SharedPageCacheCharge,
+    ) -> ReservationAttempt {
+        match accounting.try_reserve_classified(charge) {
+            SharedPageCacheReservation::Reserved => ReservationAttempt::Reserved(Self {
+                accounting,
+                charge,
+                state: AtomicU8::new(RESERVATION_STATE_RESERVED),
+            }),
+            SharedPageCacheReservation::CapacityDenied => ReservationAttempt::CapacityDenied,
+            SharedPageCacheReservation::Deferred => ReservationAttempt::Deferred,
+        }
     }
 
     fn transition(&self, from: SharedPageCacheChargeState, to: SharedPageCacheChargeState) {
@@ -611,14 +657,59 @@ impl AccountedCacheShard {
             return;
         }
 
-        let replacing = if let Some(previous) = self.entries.pop(&key) {
+        let charge = SharedPageCacheCharge {
+            kind: SharedPageCacheChargeKind::Page,
+            bytes: charge_bytes,
+        };
+        let mut reservation = match Reservation::try_new_classified(accounting.clone(), charge) {
+            ReservationAttempt::Reserved(reservation) => Some(reservation),
+            ReservationAttempt::CapacityDenied => None,
+            ReservationAttempt::Deferred => {
+                self.rejected = self.rejected.saturating_add(1);
+                return;
+            }
+        };
+        let mut replacing = false;
+
+        if reservation.is_none() {
+            let mut reclaim_attempts = self.entries.len().min(self.max_entries);
+            loop {
+                if reclaim_attempts == 0 {
+                    self.rejected = self.rejected.saturating_add(1);
+                    return;
+                }
+                let removed = if let Some(previous) = self.entries.pop(&key) {
+                    self.retire_entry(key, previous, false);
+                    self.replacements = self.replacements.saturating_add(1);
+                    replacing = true;
+                    true
+                } else {
+                    self.pop_lru_and_retire()
+                };
+                if !removed {
+                    self.rejected = self.rejected.saturating_add(1);
+                    return;
+                }
+                reclaim_attempts -= 1;
+                match Reservation::try_new_classified(accounting.clone(), charge) {
+                    ReservationAttempt::Reserved(admitted) => {
+                        reservation = Some(admitted);
+                        break;
+                    }
+                    ReservationAttempt::CapacityDenied => {}
+                    ReservationAttempt::Deferred => {
+                        self.rejected = self.rejected.saturating_add(1);
+                        return;
+                    }
+                }
+            }
+        }
+
+        if let Some(previous) = self.entries.pop(&key) {
             self.retire_entry(key, previous, false);
             self.replacements = self.replacements.saturating_add(1);
-            true
-        } else {
-            false
-        };
-
+            replacing = true;
+        }
         let resident_limit_before_insert = self.capacity_bytes - resident_weight;
         while self.resident_bytes > resident_limit_before_insert
             || self.entries.len() >= self.max_entries
@@ -629,22 +720,7 @@ impl AccountedCacheShard {
                 "a non-empty accounted shard must provide an LRU entry"
             );
         }
-
-        let charge = SharedPageCacheCharge {
-            kind: SharedPageCacheChargeKind::Page,
-            bytes: charge_bytes,
-        };
-        let mut reclaim_attempts = self.entries.len().min(self.max_entries);
-        let reservation = loop {
-            if let Some(reservation) = Reservation::try_new(accounting.clone(), charge) {
-                break reservation;
-            }
-            if reclaim_attempts == 0 || !self.pop_lru_and_retire() {
-                self.rejected = self.rejected.saturating_add(1);
-                return;
-            }
-            reclaim_attempts -= 1;
-        };
+        let reservation = reservation.expect("accounted insertion has a charged reservation");
 
         let owned_bytes = allocate_page_bytes(bytes);
         let allocation = allocate_page_owner(owned_bytes, reservation);
@@ -772,6 +848,9 @@ impl SharedPageCache {
     ///
     /// `capacity_bytes` remains the resident-byte limit used by [`SharedPageCacheStats`].
     /// `max_entries_per_shard` independently bounds each shard's retained LRU/index population.
+    /// Accounted page admission occurs before replacement or capacity eviction, so a successful
+    /// replacement may transiently charge both old and new allocations until the old page retires.
+    /// The legacy unaccounted constructor and insertion order are unchanged.
     pub fn try_with_accounting(
         capacity_bytes: usize,
         max_entries_per_shard: NonZeroUsize,
@@ -1031,6 +1110,8 @@ mod tests {
         page_release_calls: StdAtomicUsize,
         deny_metadata: StdAtomicBool,
         deny_pages: StdAtomicBool,
+        defer_pages: StdAtomicBool,
+        capacity_then_defer_pages: StdAtomicUsize,
     }
 
     impl TestAccounting {
@@ -1099,6 +1180,31 @@ mod tests {
                     }
                     Err(observed) => used = observed,
                 }
+            }
+        }
+
+        fn try_reserve_classified(
+            &self,
+            charge: SharedPageCacheCharge,
+        ) -> SharedPageCacheReservation {
+            if charge.kind == SharedPageCacheChargeKind::Page {
+                match self.capacity_then_defer_pages.load(StdOrdering::Relaxed) {
+                    1 => {
+                        self.capacity_then_defer_pages
+                            .store(2, StdOrdering::Relaxed);
+                        return SharedPageCacheReservation::CapacityDenied;
+                    }
+                    2 => return SharedPageCacheReservation::Deferred,
+                    _ if self.defer_pages.load(StdOrdering::Relaxed) => {
+                        return SharedPageCacheReservation::Deferred;
+                    }
+                    _ => {}
+                }
+            }
+            if self.try_reserve(charge) {
+                SharedPageCacheReservation::Reserved
+            } else {
+                SharedPageCacheReservation::CapacityDenied
             }
         }
 
@@ -1248,6 +1354,159 @@ mod tests {
 
         assert_eq!(cache.reclaim_unreferenced(usize::MAX), 0);
         assert_eq!(cache.stats().entries, 1);
+    }
+
+    #[test]
+    fn deferred_admission_preserves_full_shard_until_retry() {
+        let page_size = 256;
+        let max_entries = NonZeroUsize::new(2).expect("two is non-zero");
+        let capacity = one_shard_capacity(page_size, max_entries.get());
+        let metadata = metadata_charge_bytes(capacity, max_entries).expect("metadata charge");
+        let page_charge = page_charge_bytes(page_size).expect("page charge");
+        let accounting = Arc::new(TestAccounting::with_limit(metadata + page_charge * 3));
+        let cache = Arc::new(
+            SharedPageCache::try_with_accounting(capacity, max_entries, accounting.clone(), None)
+                .expect("metadata admission succeeds"),
+        );
+        let namespace = cache.new_namespace();
+        for page_id in 1..=2 {
+            namespace
+                .publisher(page_id, page_size as u32, version(page_id as u64))
+                .publish(&vec![page_id as u8; page_size]);
+        }
+        let before = cache.stats();
+
+        accounting.defer_pages.store(true, StdOrdering::Relaxed);
+        namespace
+            .publisher(3, page_size as u32, version(3))
+            .publish(&vec![3; page_size]);
+
+        let deferred = cache.stats();
+        assert_eq!(deferred.entries, before.entries);
+        assert_eq!(deferred.evictions, before.evictions);
+        assert_eq!(deferred.insertions, before.insertions);
+        assert_eq!(
+            namespace
+                .get(1, page_size as u32, version(1))
+                .expect("oldest page survives deferral")
+                .as_ref(),
+            &[1; 256]
+        );
+        assert_eq!(
+            namespace
+                .get(2, page_size as u32, version(2))
+                .expect("newest page survives deferral")
+                .as_ref(),
+            &[2; 256]
+        );
+
+        accounting.defer_pages.store(false, StdOrdering::Relaxed);
+        namespace
+            .publisher(3, page_size as u32, version(3))
+            .publish(&vec![3; page_size]);
+        let retried = cache.stats();
+        assert_eq!(retried.entries, before.entries);
+        assert_eq!(retried.evictions, before.evictions + 1);
+        assert_eq!(retried.insertions, before.insertions + 1);
+        assert_eq!(
+            namespace
+                .get(3, page_size as u32, version(3))
+                .expect("retry inserts the deferred page")
+                .as_ref(),
+            &[3; 256]
+        );
+    }
+
+    #[test]
+    fn deferred_admission_preserves_same_key_value_until_retry() {
+        let page_size = 256;
+        let max_entries = NonZeroUsize::new(1).expect("one is non-zero");
+        let capacity = one_shard_capacity(page_size, 1);
+        let metadata = metadata_charge_bytes(capacity, max_entries).expect("metadata charge");
+        let page_charge = page_charge_bytes(page_size).expect("page charge");
+        let accounting = Arc::new(TestAccounting::with_limit(metadata + page_charge * 2));
+        let cache = Arc::new(
+            SharedPageCache::try_with_accounting(capacity, max_entries, accounting.clone(), None)
+                .expect("metadata admission succeeds"),
+        );
+        let namespace = cache.new_namespace();
+        let publisher = namespace.publisher(1, page_size as u32, version(1));
+        publisher.publish(&vec![17; page_size]);
+        let before = cache.stats();
+
+        accounting.defer_pages.store(true, StdOrdering::Relaxed);
+        publisher.publish(&vec![29; page_size]);
+
+        let deferred = cache.stats();
+        assert_eq!(deferred.entries, before.entries);
+        assert_eq!(deferred.replacements, before.replacements);
+        assert_eq!(deferred.evictions, before.evictions);
+        assert_eq!(
+            namespace
+                .get(1, page_size as u32, version(1))
+                .expect("old replacement value survives deferral")
+                .as_ref(),
+            &[17; 256]
+        );
+
+        accounting.defer_pages.store(false, StdOrdering::Relaxed);
+        publisher.publish(&vec![29; page_size]);
+        let retried = cache.stats();
+        assert_eq!(retried.entries, before.entries);
+        assert_eq!(retried.replacements, before.replacements + 1);
+        assert_eq!(retried.evictions, before.evictions);
+        assert_eq!(
+            namespace
+                .get(1, page_size as u32, version(1))
+                .expect("retry installs the replacement value")
+                .as_ref(),
+            &[29; 256]
+        );
+    }
+
+    #[test]
+    fn capacity_retry_that_defers_stops_after_one_victim() {
+        let page_size = 256;
+        let max_entries = NonZeroUsize::new(2).expect("two is non-zero");
+        let capacity = one_shard_capacity(page_size, max_entries.get());
+        let metadata = metadata_charge_bytes(capacity, max_entries).expect("metadata charge");
+        let page_charge = page_charge_bytes(page_size).expect("page charge");
+        let accounting = Arc::new(TestAccounting::with_limit(metadata + page_charge * 3));
+        let cache = Arc::new(
+            SharedPageCache::try_with_accounting(capacity, max_entries, accounting.clone(), None)
+                .expect("metadata admission succeeds"),
+        );
+        let namespace = cache.new_namespace();
+        for page_id in 1..=2 {
+            namespace
+                .publisher(page_id, page_size as u32, version(page_id as u64))
+                .publish(&vec![page_id as u8; page_size]);
+        }
+        let before = cache.stats();
+
+        accounting
+            .capacity_then_defer_pages
+            .store(1, StdOrdering::Relaxed);
+        namespace
+            .publisher(3, page_size as u32, version(3))
+            .publish(&vec![3; page_size]);
+
+        let deferred_retry = cache.stats();
+        assert_eq!(deferred_retry.entries, before.entries - 1);
+        assert_eq!(deferred_retry.evictions, before.evictions + 1);
+        assert_eq!(deferred_retry.insertions, before.insertions);
+        assert!(namespace.get(3, page_size as u32, version(3)).is_none());
+
+        accounting
+            .capacity_then_defer_pages
+            .store(0, StdOrdering::Relaxed);
+        namespace
+            .publisher(3, page_size as u32, version(3))
+            .publish(&vec![3; page_size]);
+        let retried = cache.stats();
+        assert_eq!(retried.entries, before.entries);
+        assert_eq!(retried.evictions, before.evictions + 1);
+        assert_eq!(retried.insertions, before.insertions + 1);
     }
 
     #[test]

@@ -142,7 +142,7 @@ pub use statement::{Statement, StatementStatusCounter};
 pub use storage::shared_page_cache::{
     SharedPageCache, SharedPageCacheAccounting, SharedPageCacheCharge, SharedPageCacheChargeKind,
     SharedPageCacheChargeState, SharedPageCacheCreateError, SharedPageCacheLookup,
-    SharedPageCacheObserver, SharedPageCacheStats,
+    SharedPageCacheObserver, SharedPageCacheReservation, SharedPageCacheStats,
 };
 pub use storage::{
     buffer_pool::BufferPool,
