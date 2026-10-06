@@ -362,11 +362,19 @@ impl Statement {
         }
     }
 
-    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+    /// Starts this execution before its first step: gives it its identity
+    /// and, for a root statement, counts it as active on the connection.
+    ///
+    /// `Connection::interrupt` ignores a connection with no active root
+    /// statement, so an interrupt delivered between preparing a statement and
+    /// its first step is lost. A caller that may interrupt calls this first;
+    /// the first step then observes the interrupt and rolls the execution
+    /// back. A step does the same on its own; calling this again before a
+    /// reset does nothing.
+    pub fn activate_root(&mut self) {
         if self.root_generation == 0 {
             self.root_generation = self.program.connection.next_root_generation();
         }
-        self.stepped = true;
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program
                 .connection
@@ -374,6 +382,11 @@ impl Statement {
                 .fetch_add(1, Ordering::SeqCst);
             self.counted_as_active_root = true;
         }
+    }
+
+    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.activate_root();
+        self.stepped = true;
         if matches!(self.state.execution_state, ProgramExecutionState::Init) {
             if self.program.connection.mvcc_enabled() {
                 // MVCC checkpoints can publish internal schema roots without changing
@@ -1258,5 +1271,73 @@ mod tests {
             6,
             "cumulative metrics should include root and trigger writes"
         );
+    }
+
+    /// The connection ignores an interrupt while no root statement is active,
+    /// so one delivered before the first step is lost without activation.
+    #[test]
+    fn interrupt_before_the_first_step_is_lost_without_activation() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+        conn.interrupt();
+        assert!(!conn.is_interrupted(), "no root statement is active yet");
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.outcome_snapshot().terminal, Some(RootTerminal::Done));
+    }
+
+    /// Activated first, the statement takes that interrupt at its first step
+    /// and ends rolled back, under the identity it got at activation.
+    #[test]
+    fn activate_root_keeps_an_interrupt_delivered_before_the_first_step() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+        stmt.activate_root();
+        let activated = stmt.outcome_snapshot();
+        assert_eq!(activated.phase, CommitPhase::NotStarted);
+        assert_ne!(activated.identity.root_generation, 0);
+        conn.interrupt();
+        assert!(conn.is_interrupted(), "the activated statement is active");
+
+        let result = stmt.step();
+        assert!(
+            matches!(result, Ok(StepResult::Interrupt)),
+            "activate_root_interrupt: the first step takes the interrupt, got {result:?}"
+        );
+        let outcome = stmt.outcome_snapshot();
+        assert_eq!(
+            outcome.identity.root_generation,
+            activated.identity.root_generation
+        );
+        assert_eq!(outcome.phase, CommitPhase::NotPublished);
+        assert_eq!(outcome.terminal, Some(RootTerminal::RolledBack));
+        assert_eq!(
+            outcome.cancel_observed,
+            Some(CancelObserved::BeforeIrreversibleCommit)
+        );
+        drop(stmt);
+        assert!(
+            !conn.is_interrupted(),
+            "no root statement is active any more"
+        );
+        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+        assert_eq!(
+            count.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(0)]]
+        );
+    }
+
+    /// An activated statement dropped before its first step leaves the
+    /// connection without an active root statement.
+    #[test]
+    fn activated_statement_dropped_before_stepping_is_released() {
+        let conn = open_test_connection().unwrap();
+        let mut stmt = conn.prepare("SELECT 1").unwrap();
+        stmt.activate_root();
+        stmt.activate_root();
+        assert_eq!(conn.n_active_root_statements.load(Ordering::SeqCst), 1);
+        drop(stmt);
+        assert_eq!(conn.n_active_root_statements.load(Ordering::SeqCst), 0);
     }
 }
