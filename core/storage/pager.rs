@@ -1029,6 +1029,24 @@ enum CommitState {
     /// Checkpoint the WAL to the database file (if needed).
     /// This is decoupled from commit - checkpoint failure does not affect commit durability.
     AutoCheckpoint,
+    /// The commit is published but its auto-checkpoint is given up (it failed,
+    /// or the statement is torn down). The checkpoint's IO still in flight
+    /// finishes first; then the commit ends as committed.
+    AbandonCheckpoint,
+}
+
+/// How far the connection's current commit got. Once its append is
+/// submitted, an interrupt or a statement teardown must not roll it back: it
+/// ends as committed, or fails on its own IO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitFinality {
+    /// No commit append submitted yet, or no commit in progress.
+    NotSubmitted,
+    /// The commit append is submitted and not yet published.
+    Submitted,
+    /// The commit is published, durable and visible; only its
+    /// auto-checkpoint is left.
+    Published,
 }
 
 #[derive(Debug, Default)]
@@ -1707,6 +1725,38 @@ impl Pager {
         // Cloned out so the hook runs with no pager lock held.
         let hook = self.commit_hook.read().clone();
         hook.map_or(commit_hooks::HookAction::Continue, |hook| hook(point))
+    }
+
+    pub(crate) fn commit_finality(&self) -> CommitFinality {
+        match self.commit_info.read().state {
+            CommitState::PrepareWal
+            | CommitState::PrepareWalSync
+            | CommitState::GetDbSize
+            | CommitState::ScanAndIssueReads { .. }
+            | CommitState::WaitBatchedReads { .. }
+            | CommitState::PrepareFrames { .. }
+            | CommitState::SubmitFrames => CommitFinality::NotSubmitted,
+            CommitState::WaitWrites | CommitState::WaitSync | CommitState::WalCommitDone => {
+                CommitFinality::Submitted
+            }
+            CommitState::AutoCheckpoint | CommitState::AbandonCheckpoint => {
+                CommitFinality::Published
+            }
+        }
+    }
+
+    /// Gives up the auto-checkpoint of a published commit; the commit ends as
+    /// committed once the checkpoint's IO in flight finished.
+    pub(crate) fn abandon_auto_checkpoint(&self) {
+        let mut commit_info = self.commit_info.write();
+        turso_assert!(
+            matches!(
+                commit_info.state,
+                CommitState::AutoCheckpoint | CommitState::AbandonCheckpoint
+            ),
+            "only a published commit's auto-checkpoint can be abandoned"
+        );
+        commit_info.state = CommitState::AbandonCheckpoint;
     }
 
     /// Runs the BeforeIrreversibleCommit hook once per commit; true if it
@@ -2947,10 +2997,21 @@ impl Pager {
                         Ok(IOResult::Done(_)) => complete_commit(),
                         Err(err) => {
                             tracing::debug!("auto-checkpoint failed: {err}");
-                            complete_commit();
-                            self.cleanup_after_auto_checkpoint_failure();
+                            self.commit_info.write().state = CommitState::AbandonCheckpoint;
+                            continue;
                         }
                     }
+                    self.clear_savepoints()?;
+                    return Ok(IOResult::Done(()));
+                }
+                CommitState::AbandonCheckpoint => {
+                    // The checkpoint's locks and buffers are given up only
+                    // once none of its IO is still in flight.
+                    if let Some(c) = wal.checkpoint_io_in_flight() {
+                        io_yield_one!(c);
+                    }
+                    complete_commit();
+                    self.cleanup_after_auto_checkpoint_failure();
                     self.clear_savepoints()?;
                     return Ok(IOResult::Done(()));
                 }
@@ -4200,7 +4261,9 @@ impl Pager {
                         self.run_commit_hook(commit_hooks::CommitHookPoint::AfterCommitPublication);
                     return Ok(IOResult::Done(()));
                 }
-                CommitState::AutoCheckpoint => panic!("checkpoint must be handled externally"),
+                CommitState::AutoCheckpoint | CommitState::AbandonCheckpoint => {
+                    panic!("checkpoint must be handled externally")
+                }
             }
         }
     }
@@ -6197,6 +6260,7 @@ mod commit_finality_tests {
     };
 
     const DB_PATH: &str = "issue-124-commit-finality.db";
+    const WAL_PATH: &str = "issue-124-commit-finality.db-wal";
     /// ~3000-byte rows fill a leaf page each, so one commit of this many rows
     /// writes more WAL frames than the default 1000-frame auto-checkpoint
     /// threshold.
@@ -6487,7 +6551,8 @@ mod commit_finality_tests {
 
     /// The pinned engine answers this interrupt by rolling the published
     /// commit back, which releases the WAL write lock a second time and trips
-    /// `WalFile::end_write_tx`'s assertion. The commit must finish instead.
+    /// `WalFile::end_write_tx`'s assertion. The commit must finish instead;
+    /// the interrupt only gives its auto-checkpoint up.
     #[test]
     fn interrupt_during_post_publication_auto_checkpoint_keeps_the_commit() {
         if std::env::var_os(CHILD).is_none() {
@@ -6520,5 +6585,170 @@ mod commit_finality_tests {
         conn.execute("INSERT INTO t(v) VALUES (1)")
             .expect("the connection writes again");
         assert_eq!(count_rows(&reader, &io), ROWS + 1);
+    }
+
+    /// A failed auto-checkpoint write after publication gives the checkpoint
+    /// up; the commit still ends as committed.
+    #[test]
+    fn failed_checkpoint_write_after_publication_keeps_the_commit() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let (db, conn, io, held) = open_with_held_writes(DB_PATH);
+        begin_large_transaction(&conn);
+        let mut commit = conn.prepare("COMMIT").expect("the commit prepares");
+        step_until_held(&mut commit, &io, &held);
+        let pager = assert_published_and_checkpointing(&conn);
+        let failure = CompletionError::IOError(std::io::ErrorKind::Other, "injected write failure");
+        assert!(held.release_with(Some(failure)) > 0);
+
+        let result = finish(&mut commit, &io);
+        assert!(
+            matches!(result, Ok(StepResult::Done)),
+            "commit_finality_checkpoint_failure: the published COMMIT must finish, got {result:?}"
+        );
+        drop(commit);
+        assert!(
+            !pager.is_checkpointing(),
+            "the failed checkpoint was given up"
+        );
+        assert_eq!(conn.get_tx_state(), TransactionState::None);
+        let reader = db.connect().expect("a reader");
+        assert_eq!(count_rows(&reader, &io), ROWS, "the published rows stay");
+        conn.execute("INSERT INTO t(v) VALUES (1)")
+            .expect("the connection writes again");
+        assert_eq!(count_rows(&reader, &io), ROWS + 1);
+    }
+
+    /// Resetting (or dropping) a COMMIT whose published commit is still
+    /// auto-checkpointing ends the commit instead of rolling it back.
+    #[test]
+    fn reset_during_post_publication_auto_checkpoint_keeps_the_commit() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let (db, conn, io, held) = open_with_held_writes(DB_PATH);
+        begin_large_transaction(&conn);
+        let mut commit = conn.prepare("COMMIT").expect("the commit prepares");
+        step_until_held(&mut commit, &io, &held);
+        let pager = assert_published_and_checkpointing(&conn);
+        assert!(held.release() > 0);
+
+        commit
+            .reset()
+            .expect("commit_finality_reset: the reset ends the published commit");
+        drop(commit);
+        assert!(!pager.is_checkpointing(), "the checkpoint was given up");
+        assert_eq!(conn.get_tx_state(), TransactionState::None);
+        let reader = db.connect().expect("a reader");
+        assert_eq!(count_rows(&reader, &io), ROWS, "the published rows stay");
+        conn.execute("INSERT INTO t(v) VALUES (1)")
+            .expect("the connection writes again");
+        assert_eq!(count_rows(&reader, &io), ROWS + 1);
+    }
+
+    /// An interrupt after the commit append was submitted, before it is
+    /// published, cannot undo the append: the commit finishes and stays.
+    #[test]
+    fn interrupt_after_the_commit_append_is_submitted_keeps_the_commit() {
+        let (db, conn, io, held) = open_with_held_writes(WAL_PATH);
+        let mut insert = conn
+            .prepare("INSERT INTO t(v) VALUES (1)")
+            .expect("the insert prepares");
+        step_until_held(&mut insert, &io, &held);
+        assert_eq!(
+            conn.pager.load().commit_finality(),
+            CommitFinality::Submitted
+        );
+        conn.interrupt();
+        assert!(conn.is_interrupted());
+        assert!(held.release() > 0);
+
+        let result = finish(&mut insert, &io);
+        assert!(
+            matches!(result, Ok(StepResult::Done)),
+            "commit_finality_submitted_interrupt: the submitted commit must finish, got {result:?}"
+        );
+        drop(insert);
+        assert_eq!(count_rows(&db.connect().expect("a reader"), &io), 1);
+    }
+
+    /// The other side of the boundary: an interrupt observed before the commit
+    /// append is submitted rolls the commit back.
+    #[test]
+    fn interrupt_before_the_commit_append_rolls_the_commit_back() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), "commit-finality-before-append.db")
+            .expect("the database opens");
+        let conn = db.connect().expect("a connection");
+        conn.execute("CREATE TABLE t(v)")
+            .expect("the table is created");
+        let _guard =
+            conn.install_commit_test_hook(Arc::new(|point: CommitHookPoint| -> HookAction {
+                match point {
+                    CommitHookPoint::BeforeIrreversibleCommit => HookAction::Yield,
+                    _ => HookAction::Continue,
+                }
+            }));
+        let mut insert = conn
+            .prepare("INSERT INTO t VALUES (1)")
+            .expect("the insert prepares");
+        assert!(
+            matches!(insert.step(), Ok(StepResult::IO)),
+            "the insert stops before its commit append"
+        );
+        assert_eq!(
+            conn.pager.load().commit_finality(),
+            CommitFinality::NotSubmitted
+        );
+        conn.interrupt();
+        let result = insert.step();
+        assert!(
+            matches!(
+                result,
+                Ok(StepResult::Interrupt) | Err(LimboError::Interrupt)
+            ),
+            "the interrupt is observed before the append, got {result:?}"
+        );
+        drop(insert);
+        assert_eq!(
+            count_rows(&db.connect().expect("a reader"), &io),
+            0,
+            "nothing was published"
+        );
+        conn.execute("INSERT INTO t VALUES (2)")
+            .expect("the connection writes again");
+        assert_eq!(count_rows(&conn, &io), 1);
+    }
+
+    /// Without a hook, or with one that never yields, a commit takes the same
+    /// steps as before the hooks existed: a MemoryIO insert ends in one step.
+    #[test]
+    fn commit_without_a_yielding_hook_takes_no_extra_step() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), "commit-finality-no-hook.db")
+            .expect("the database opens");
+        let conn = db.connect().expect("a connection");
+        conn.execute("CREATE TABLE t(v)")
+            .expect("the table is created");
+        let mut insert = conn
+            .prepare("INSERT INTO t VALUES (1)")
+            .expect("the insert prepares");
+        assert!(
+            matches!(insert.step(), Ok(StepResult::Done)),
+            "no hook: one step"
+        );
+        drop(insert);
+        let _guard =
+            conn.install_commit_test_hook(Arc::new(|_: CommitHookPoint| HookAction::Continue));
+        let mut insert = conn
+            .prepare("INSERT INTO t VALUES (2)")
+            .expect("the insert prepares");
+        assert!(
+            matches!(insert.step(), Ok(StepResult::Done)),
+            "a hook that never yields: still one step"
+        );
     }
 }

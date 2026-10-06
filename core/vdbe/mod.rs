@@ -65,7 +65,7 @@ use smallvec::SmallVec;
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{
-    storage::pager::Pager,
+    storage::pager::{CommitFinality, Pager},
     translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, ImmutableRecord, Value},
     vdbe::{builder::CursorType, insn::Insn},
@@ -1539,6 +1539,51 @@ impl Program {
         }
     }
 
+    /// Whether this statement drives a WAL commit whose append is already
+    /// submitted, which an interrupt or a teardown must not roll back.
+    fn commit_append_submitted(&self, state: &ProgramState, pager: &Pager) -> bool {
+        matches!(state.commit_state, CommitState::Committing)
+            && pager.commit_finality() != CommitFinality::NotSubmitted
+    }
+
+    /// Whether this statement drives a WAL commit that is already published.
+    fn commit_published(&self, state: &ProgramState, pager: &Pager) -> bool {
+        matches!(state.commit_state, CommitState::Committing)
+            && pager.commit_finality() == CommitFinality::Published
+    }
+
+    /// A statement torn down (reset, drop, abort) after its commit append
+    /// was submitted must not roll the transaction back: the append may be
+    /// durable already. Drive the commit to its end instead; a published
+    /// commit gives its auto-checkpoint up rather than running it. Ok(false)
+    /// when there is no such commit, or when the error being handled is the
+    /// append itself failing; the caller then rolls back as before.
+    fn end_commit_past_its_append(
+        &self,
+        pager: &Arc<Pager>,
+        err: Option<&LimboError>,
+        state: &mut ProgramState,
+    ) -> Result<bool> {
+        if !matches!(state.commit_state, CommitState::Committing) {
+            return Ok(false);
+        }
+        match pager.commit_finality() {
+            CommitFinality::NotSubmitted => return Ok(false),
+            CommitFinality::Submitted if err.is_some() => return Ok(false),
+            CommitFinality::Submitted | CommitFinality::Published => {}
+        }
+        let mv_store = self.connection.mv_store();
+        loop {
+            if pager.commit_finality() == CommitFinality::Published {
+                pager.abandon_auto_checkpoint();
+            }
+            match self.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
+                IOResult::Done(_) => return Ok(true),
+                IOResult::IO(io) => io.wait(pager.io.as_ref())?,
+            }
+        }
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     fn normal_step(
         &self,
@@ -1557,8 +1602,17 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if self.maybe_request_interrupt(state, pager.io.as_ref()) {
-                self.abort(pager, None, state)?;
-                return Ok(StepResult::Interrupt);
+                // Once this statement's commit append is submitted an interrupt
+                // cannot undo it: the commit ends as committed, or fails on its
+                // own IO. After publication only the auto-checkpoint is left,
+                // and the interrupt gives that up.
+                if !self.commit_append_submitted(state, pager) {
+                    self.abort(pager, None, state)?;
+                    return Ok(StepResult::Interrupt);
+                }
+                if self.commit_published(state, pager) {
+                    pager.abandon_auto_checkpoint();
+                }
             }
 
             if let Some(io) = &state.io_completions {
@@ -1566,7 +1620,18 @@ impl Program {
                     io.set_waker(waker);
                     return Ok(StepResult::IO);
                 }
-                if let Some(err) = io.get_error() {
+                if let Some(err) = io
+                    .get_error()
+                    .filter(|_| self.commit_published(state, pager))
+                {
+                    // The failed IO is the auto-checkpoint's, and the commit is
+                    // already durable and visible: give the checkpoint up and
+                    // let the commit end as committed.
+                    tracing::warn!(
+                        "auto-checkpoint IO failed after the commit was published: {err}"
+                    );
+                    pager.abandon_auto_checkpoint();
+                } else if let Some(err) = io.get_error() {
                     if pager.is_checkpointing() {
                         // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
                         // so that abort() knows not to try to rollback the transaction, because the transaction
@@ -2260,7 +2325,22 @@ impl Program {
             self.connection.end_trigger_execution();
         }
         // Errors from nested statements are handled by the parent statement.
-        if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+        let top_level = !self.connection.is_nested_stmt() && !self.is_trigger_subprogram();
+        let commit_ended = top_level
+            && match self.end_commit_past_its_append(pager, err, state) {
+                Ok(ended) => ended,
+                Err(end_err) => {
+                    capture_abort_error(
+                        &mut abort_error,
+                        end_err,
+                        "Failed to end a submitted commit during abort",
+                    );
+                    // A published commit is never rolled back, even when
+                    // ending it failed.
+                    pager.commit_finality() == CommitFinality::Published
+                }
+            };
+        if top_level && !commit_ended {
             let owns_auto_txn = state.owns_auto_txn();
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —

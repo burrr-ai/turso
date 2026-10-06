@@ -734,6 +734,11 @@ pub trait Wal: Debug + Send + Sync {
     fn get_min_frame(&self) -> u64;
     fn rollback(&self, rollback_to: Option<RollbackTo>);
     fn abort_checkpoint(&self);
+    /// One IO of the ongoing checkpoint that has not finished yet, if any;
+    /// called repeatedly until none is left before a checkpoint is given up.
+    fn checkpoint_io_in_flight(&self) -> Option<Completion> {
+        None
+    }
     fn get_last_checksum(&self) -> (u32, u32);
 
     /// Return unique set of pages changed **after** frame_watermark position and until current WAL session max_frame_no
@@ -2424,6 +2429,8 @@ struct OngoingCheckpoint {
 struct InflightWriteBatch {
     done: Arc<AtomicBool>,
     err: Arc<crate::sync::OnceLock<CompletionError>>,
+    /// The batch's write completions, so a checkpoint given up can wait for them.
+    completions: Vec<Completion>,
 }
 
 impl OngoingCheckpoint {
@@ -2525,6 +2532,7 @@ impl InflightWriteBatch {
         InflightWriteBatch {
             done: Arc::new(AtomicBool::new(false)),
             err: Arc::new(OnceLock::new()),
+            completions: Vec::new(),
         }
     }
 }
@@ -3832,6 +3840,22 @@ impl Wal for WalFile {
         self.reset_internal_states();
     }
 
+    fn checkpoint_io_in_flight(&self) -> Option<Completion> {
+        let ongoing = self.ongoing_checkpoint.read();
+        ongoing
+            .inflight_reads
+            .iter()
+            .map(|read| &read.completion)
+            .chain(
+                ongoing
+                    .inflight_writes
+                    .iter()
+                    .flat_map(|write| write.completions.iter()),
+            )
+            .find(|c| !c.finished())
+            .cloned()
+    }
+
     fn try_begin_vacuum_checkpoint_lock(&self) -> Result<()> {
         self.with_shared(|shared| {
             if !shared.runtime.checkpoint_lock.write() {
@@ -4635,14 +4659,15 @@ impl WalFile {
                     if should_flush {
                         let batch_map = ongoing_chkpt.pending_writes.take();
                         if !batch_map.is_empty() {
-                            let new_write = InflightWriteBatch::new();
-                            for c in write_pages_vectored(
+                            let mut new_write = InflightWriteBatch::new();
+                            new_write.completions = write_pages_vectored(
                                 pager,
                                 batch_map,
                                 new_write.done.clone(),
                                 new_write.err.clone(),
-                            )? {
-                                group.add(&c);
+                            )?;
+                            for c in &new_write.completions {
+                                group.add(c);
                                 nr_completions += 1;
                             }
                             ongoing_chkpt.inflight_writes.push(new_write);
