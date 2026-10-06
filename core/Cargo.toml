@@ -36,6 +36,8 @@ pure-rust-crypto = ["aegis/pure-rust"]
 checksum = []
 cli_only = []
 test_helper = []
+# Test-only pause point in CompletionGroup::build; off by default and implies nothing else.
+completion_test_hooks = []
 bench = []
 nanosecond-bench = ["bench"]
 fts = ["dep:tantivy"]

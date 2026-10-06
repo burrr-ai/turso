@@ -173,6 +173,8 @@ impl CompletionGroup {
         for mut c in self.completions {
             // If the completion has not completed, link it to the group.
             if !c.finished() {
+                #[cfg(any(test, feature = "completion_test_hooks"))]
+                registration_hooks::before_child_register();
                 c.link_internal(&group);
                 continue;
             }
@@ -201,6 +203,49 @@ impl CompletionGroup {
             (group_inner.complete)(Ok(0));
         }
         group
+    }
+}
+
+/// Test-only pause point in [`CompletionGroup::build`]: after a child was
+/// observed unfinished and before it is registered with the group. It is
+/// scoped to the calling thread, so builds on other threads are unaffected.
+#[cfg(any(test, feature = "completion_test_hooks"))]
+pub mod registration_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        static BEFORE_CHILD_REGISTER: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `f` with `hook` called each time a `CompletionGroup::build` on
+    /// this thread is about to register a child it observed unfinished.
+    pub fn with_before_child_register<T>(hook: impl FnMut() + 'static, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<Hook>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let previous = self.0.take();
+                let _ = BEFORE_CHILD_REGISTER.try_with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+        let previous = BEFORE_CHILD_REGISTER.with(|slot| slot.borrow_mut().replace(Box::new(hook)));
+        let _restore = Restore(previous);
+        f()
+    }
+
+    pub(super) fn before_child_register() {
+        // Taken out while it runs, so the hook itself may build a group.
+        let Some(mut hook) = BEFORE_CHILD_REGISTER.with(|slot| slot.borrow_mut().take()) else {
+            return;
+        };
+        hook();
+        BEFORE_CHILD_REGISTER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
     }
 }
 
@@ -1314,5 +1359,165 @@ mod tests {
         // Callback should only be called once
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert!(c.failed());
+    }
+
+    /// Re-runs the calling test alone in a child process bounded by `budget`,
+    /// so a wait that never returns ends the child, not this test thread.
+    fn run_current_test_in_child(child_env: &str, budget: std::time::Duration) {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let name = std::thread::current()
+            .name()
+            .expect("libtest names its test threads")
+            .to_string();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(child_env, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Drain both pipes while polling, so a chatty child never blocks on a
+        // full pipe and looks like a timeout.
+        let drain = |mut pipe: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = pipe.read_to_string(&mut text);
+                text
+            })
+        };
+        let stdout = drain(Box::new(child.stdout.take().unwrap()));
+        let stderr = drain(Box::new(child.stderr.take().unwrap()));
+        let deadline = Instant::now() + budget;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // The child has exited or was killed, so both pipes are closed.
+        let stdout = stdout.join().unwrap();
+        let stderr = stderr.join().unwrap();
+        let Some(status) = status else {
+            panic!("{name}: child exceeded its {budget:?} budget\n{stdout}{stderr}");
+        };
+        assert!(
+            status.success()
+                && stdout.contains("running 1 test")
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored"),
+            "{name}: child failed ({status})\n{stdout}{stderr}"
+        );
+    }
+
+    /// A peer that completes a child after `build` observed it unfinished but
+    /// before `build` registered it with the group must still be counted;
+    /// otherwise the group never finishes and every wait on it steps forever.
+    #[test]
+    fn completion_group_peer_completion_during_registration_is_not_lost() {
+        use crate::IO;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const CHILD: &str = "TURSO_COMPLETION_REGISTRATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, Duration::from_secs(20));
+            return;
+        }
+
+        let child_calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let child = |index: usize| {
+            let calls = child_calls.clone();
+            Completion::new_sync(move |_| {
+                calls[index].fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let (c0, c1) = (child(0), child(1));
+        let group_calls = Arc::new(AtomicUsize::new(0));
+        let mut group = CompletionGroup::new({
+            let calls = group_calls.clone();
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        group.add(&c0);
+        group.add(&c1);
+
+        // The peer completes both children while `build` is paused between
+        // observing c1 unfinished and registering it. Channels fix the order.
+        let (paused_tx, paused_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let peer = {
+            let (c0, c1) = (c0.clone(), c1.clone());
+            std::thread::spawn(move || {
+                if paused_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                    return None;
+                }
+                c0.complete(0);
+                c1.complete(0);
+                // Witness after both completions returned, not from a callback.
+                let finished = (c0.finished(), c1.finished());
+                resume_tx.send(()).unwrap();
+                Some(finished)
+            })
+        };
+        let mut registrations = 0;
+        let group = registration_hooks::with_before_child_register(
+            move || {
+                registrations += 1;
+                if registrations == 2 {
+                    paused_tx.send(()).unwrap();
+                    if resume_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                        panic!("completion_group_registration_rendezvous: the peer never resumed");
+                    }
+                }
+            },
+            || group.build(),
+        );
+        let finished = peer.join().unwrap();
+        assert_eq!(
+            finished,
+            Some((true, true)),
+            "completion_group_registration_rendezvous: build never paused before c1"
+        );
+
+        let outstanding = match &group.get_inner().completion_type {
+            CompletionType::Group(g) => g.inner.outstanding.load(Ordering::SeqCst),
+            _ => unreachable!(),
+        };
+        let (waited_tx, waited_rx) = mpsc::channel();
+        {
+            let group = group.clone();
+            // Never joined: on a lost notification this thread steps forever.
+            std::thread::spawn(move || {
+                let _ = waited_tx.send(crate::MemoryIO::new().wait_for_completion(group));
+            });
+        }
+        let waited = waited_rx.recv_timeout(Duration::from_secs(5));
+        let calls = || {
+            (
+                child_calls[0].load(Ordering::SeqCst),
+                child_calls[1].load(Ordering::SeqCst),
+                group_calls.load(Ordering::SeqCst),
+            )
+        };
+        let Ok(waited) = waited else {
+            panic!(
+                "completion_group_registration_deadline: wait_for_completion did not return \
+                 within 5s; outstanding={outstanding} children_finished={finished:?} \
+                 (child0, child1, group) callbacks={:?}",
+                calls()
+            );
+        };
+        waited.unwrap();
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert_eq!(calls(), (1, 1, 1));
     }
 }
