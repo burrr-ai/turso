@@ -52,7 +52,7 @@ io_yield_one!(combined);
 
 `CompletionGroup` features:
 - Aggregates multiple completions into one
-- Calls callback when all complete (or any errors)
+- Calls callback once every child finished, with the first reconciled error if any failed
 - Can nest groups (add a group's completion to another group)
 - Cancellable via `group.cancel()`
 

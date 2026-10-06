@@ -1,4 +1,4 @@
-use crate::turso_assert_eq;
+use crate::{turso_assert, turso_assert_eq};
 use core::fmt::{self, Debug};
 use std::{
     future::Future,
@@ -107,8 +107,9 @@ pub(super) struct CompletionInner {
     // Thread safe with OnceLock
     pub(super) result: crate::sync::OnceLock<Option<CompletionError>>,
     context: Context,
-    /// Optional parent group this completion belongs to
-    parent: OnceLock<Arc<GroupCompletionInner>>,
+    /// The group this completion belongs to and whether the group was told
+    /// about its result.
+    link: Mutex<ParentLink>,
     /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
     /// where pwrite returns before the kernel has consumed the buffer.
     write_buffer: OnceLock<Arc<Buffer>>,
@@ -118,8 +119,38 @@ impl fmt::Debug for CompletionInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompletionInner")
             .field("completion_type", &self.completion_type)
-            .field("parent", &self.parent.get().is_some())
+            .field("parent", &self.link.lock().parent.is_some())
             .finish()
+    }
+}
+
+/// A completion's membership in a [`CompletionGroup`]. Registration with the
+/// group and publication of the completion's result can happen in either
+/// order on different threads; whichever comes second sees both under this
+/// lock and claims the one notification to the group. The group is told
+/// outside the lock, so no callback, waker or other completion's lock ever
+/// runs under it.
+#[derive(Default)]
+struct ParentLink {
+    parent: Option<Arc<GroupCompletionInner>>,
+    /// Set by the call that published the completion's `result`, after it did.
+    published: bool,
+    notified: bool,
+}
+
+impl ParentLink {
+    /// Called once after registration and once after result publication;
+    /// only the second of the two finds both and claims the notification.
+    fn claim(&mut self) -> Option<Arc<GroupCompletionInner>> {
+        let (Some(parent), true) = (&self.parent, self.published) else {
+            return None;
+        };
+        turso_assert!(
+            !self.notified,
+            "a completion's group is told about its result only once"
+        );
+        self.notified = true;
+        Some(parent.clone())
     }
 }
 
@@ -139,6 +170,10 @@ impl CompletionGroup {
         }
     }
 
+    /// A non-yield completion belongs to one group only: adding it to a second
+    /// group, even after it finished, panics in `build`. An explicit yield
+    /// completion (an empty group's result, for one) has nothing to link and
+    /// counts as already succeeded in any group.
     pub fn add(&mut self, completion: &Completion) {
         self.completions.push(completion.clone());
     }
@@ -156,91 +191,126 @@ impl CompletionGroup {
         }
     }
 
+    /// Finishes once every child finished, with the first error it reconciled;
+    /// panics if a non-yield child is already in another group.
     pub fn build(self) -> Completion {
         let total = self.completions.len();
         if total == 0 {
             (self.callback)(Ok(0));
             return Completion::new_yield();
         }
-        let group_completion = GroupCompletion::new(self.callback, total);
+        // One count more than the children: build holds it until every child
+        // is registered, so children finishing meanwhile cannot finish the
+        // group before it is built.
+        let group_completion = GroupCompletion::new(self.callback, total + 1);
         let group = Completion::new(CompletionType::Group(group_completion));
-
-        // Store the group completion reference for later callback
-        if let CompletionType::Group(ref g) = group.get_inner().completion_type {
-            let _ = g.inner.self_completion.set(group.clone());
-        }
-
-        for mut c in self.completions {
-            // If the completion has not completed, link it to the group.
-            if !c.finished() {
-                #[cfg(any(test, feature = "completion_test_hooks"))]
-                registration_hooks::before_child_register();
-                c.link_internal(&group);
-                continue;
-            }
-            let group_inner = match &group.get_inner().completion_type {
-                CompletionType::Group(g) => &g.inner,
-                _ => unreachable!(),
-            };
-            // Return early if there was an error.
-            if let Some(err) = c.get_error() {
-                let _ = group_inner.result.set(Some(err));
-                group_inner.outstanding.store(0, Ordering::SeqCst);
-                (group_inner.complete)(Err(err));
-                return group;
-            }
-            // Mark the successful completion as done.
-            group_inner.outstanding.fetch_sub(1, Ordering::SeqCst);
-        }
-
         let group_inner = match &group.get_inner().completion_type {
-            CompletionType::Group(g) => &g.inner,
+            CompletionType::Group(g) => g.inner.clone(),
             _ => unreachable!(),
         };
-        if group_inner.outstanding.load(Ordering::SeqCst) == 0 {
-            // Set result to Some(None) on success so succeeded() returns true
-            let _ = group_inner.result.set(None);
-            (group_inner.complete)(Ok(0));
+        // Installed before any child is registered: a registered child may
+        // be the one that finishes the group.
+        group_inner
+            .self_completion
+            .set(group.clone())
+            .expect("a new group has no completion yet");
+
+        // Every child is registered, finished or not, even after one failed:
+        // the group finishes only once every child's IO has finished, with
+        // the first error.
+        for c in self.completions {
+            #[cfg(any(test, feature = "completion_test_hooks"))]
+            registration_hooks::before_child_register(&c);
+            c.link_internal(&group_inner);
+            #[cfg(any(test, feature = "completion_test_hooks"))]
+            registration_hooks::after_child_register();
         }
+        group_inner.release();
         group
     }
 }
 
-/// Test-only pause point in [`CompletionGroup::build`]: after a child was
-/// observed unfinished and before it is registered with the group. It is
-/// scoped to the calling thread, so builds on other threads are unaffected.
+/// Test-only pause points in the bookkeeping between a [`CompletionGroup`]
+/// and its children. Every point is outside the bookkeeping lock, so a paused
+/// thread blocks no other thread's completion. Hooks are scoped to the
+/// calling thread, so builds and completions on other threads are unaffected.
 #[cfg(any(test, feature = "completion_test_hooks"))]
 pub mod registration_hooks {
     use std::cell::RefCell;
 
-    type Hook = Box<dyn FnMut()>;
+    use super::Completion;
 
-    thread_local! {
-        static BEFORE_CHILD_REGISTER: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HookPoint {
+        /// In [`super::CompletionGroup::build`], after a child was observed
+        /// unfinished and before it is registered with the group.
+        BeforeChildRegister,
+        /// In [`super::CompletionGroup::build`], after a child was registered
+        /// and before the next one (or the build's own count) is handled.
+        AfterChildRegister,
+        /// In a completion's callback, after its result was published and
+        /// before its group, if any, is told.
+        AfterResultPublished,
     }
 
-    /// Runs `f` with `hook` called each time a `CompletionGroup::build` on
-    /// this thread is about to register a child it observed unfinished.
-    pub fn with_before_child_register<T>(hook: impl FnMut() + 'static, f: impl FnOnce() -> T) -> T {
+    type Hook = Box<dyn FnMut(HookPoint)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `f` with `hook` called at every [`HookPoint`] this thread reaches.
+    pub fn with_hook<T>(hook: impl FnMut(HookPoint) + 'static, f: impl FnOnce() -> T) -> T {
         struct Restore(Option<Hook>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 let previous = self.0.take();
-                let _ = BEFORE_CHILD_REGISTER.try_with(|slot| *slot.borrow_mut() = previous);
+                let _ = HOOK.try_with(|slot| *slot.borrow_mut() = previous);
             }
         }
-        let previous = BEFORE_CHILD_REGISTER.with(|slot| slot.borrow_mut().replace(Box::new(hook)));
+        let previous = HOOK.with(|slot| slot.borrow_mut().replace(Box::new(hook)));
         let _restore = Restore(previous);
         f()
     }
 
-    pub(super) fn before_child_register() {
-        // Taken out while it runs, so the hook itself may build a group.
-        let Some(mut hook) = BEFORE_CHILD_REGISTER.with(|slot| slot.borrow_mut().take()) else {
+    /// Runs `f` with `hook` called each time a `CompletionGroup::build` on
+    /// this thread is about to register a child it observed unfinished.
+    pub fn with_before_child_register<T>(
+        mut hook: impl FnMut() + 'static,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        with_hook(
+            move |point| {
+                if point == HookPoint::BeforeChildRegister {
+                    hook();
+                }
+            },
+            f,
+        )
+    }
+
+    pub(super) fn before_child_register(child: &Completion) {
+        if !child.finished() {
+            hit(HookPoint::BeforeChildRegister);
+        }
+    }
+
+    pub(super) fn after_child_register() {
+        hit(HookPoint::AfterChildRegister);
+    }
+
+    pub(super) fn after_result_published() {
+        hit(HookPoint::AfterResultPublished);
+    }
+
+    fn hit(point: HookPoint) {
+        // Taken out while it runs, so the hook itself may build a group or
+        // complete a completion.
+        let Some(mut hook) = HOOK.with(|slot| slot.borrow_mut().take()) else {
             return;
         };
-        hook();
-        BEFORE_CHILD_REGISTER.with(|slot| {
+        hook(point);
+        HOOK.with(|slot| {
             let mut slot = slot.borrow_mut();
             if slot.is_none() {
                 *slot = Some(hook);
@@ -265,14 +335,50 @@ impl fmt::Debug for GroupCompletion {
 }
 
 struct GroupCompletionInner {
-    /// Number of completions that need to finish
+    /// Children not yet accounted for, plus the one count `build` holds
+    /// until every child is registered.
     outstanding: AtomicUsize,
     /// Callback to invoke when all completions finish
     complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
-    /// Cached result after all completions finish
-    result: OnceLock<Option<CompletionError>>,
+    /// The first child error this group observed while reconciling its
+    /// children, not necessarily the earliest IO to fail; the group finishes
+    /// with it.
+    first_error: OnceLock<CompletionError>,
     /// Reference to the group's own Completion for notifying parents
     self_completion: OnceLock<Completion>,
+}
+
+impl GroupCompletionInner {
+    /// Accounts for one child's result. [`ParentLink::claim`] makes sure
+    /// this is called exactly once per child.
+    fn child_finished(&self, error: Option<CompletionError>) {
+        if let Some(err) = error {
+            // Only the first error is kept.
+            let _ = self.first_error.set(err);
+        }
+        self.release();
+    }
+
+    /// Drops one count. The call that takes it to zero finishes the group,
+    /// exactly once, through the group completion's own callback, so the
+    /// group's result is published like any other completion's.
+    fn release(&self) {
+        let prev = self.outstanding.fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(
+            prev > 0,
+            "completion group released more counts than it holds"
+        );
+        let group = self
+            .self_completion
+            .get()
+            .expect("build installs the group completion before registering children");
+        if prev == 1 {
+            group.callback(self.first_error.get().map_or(Ok(0), |err| Err(*err)));
+        } else {
+            // progress wake so the waiter keeps driving io.step
+            group.wake();
+        }
+    }
 }
 
 impl GroupCompletion {
@@ -284,7 +390,7 @@ impl GroupCompletion {
             inner: Arc::new(GroupCompletionInner {
                 outstanding: AtomicUsize::new(outstanding),
                 complete: Box::new(complete),
-                result: OnceLock::new(),
+                first_error: OnceLock::new(),
                 self_completion: OnceLock::new(),
             }),
         }
@@ -328,7 +434,7 @@ impl CompletionInner {
             completion_type,
             result: OnceLock::new(),
             context: Context::new(),
-            parent: OnceLock::new(),
+            link: Mutex::new(ParentLink::default()),
             write_buffer: OnceLock::new(),
         }
     }
@@ -418,7 +524,8 @@ impl Completion {
     /// drains the CQ, the resubmitted chunks pile up and the task deadlocks.
     pub fn wake_progress(&self) {
         if let Some(inner) = &self.inner {
-            if let Some(group) = inner.parent.get() {
+            let parent = inner.link.lock().parent.clone();
+            if let Some(group) = parent {
                 if let Some(group_completion) = group.self_completion.get() {
                     group_completion.wake();
                 }
@@ -435,15 +542,11 @@ impl Completion {
         }
     }
 
+    // A group's result is published like any other completion's, once,
+    // after its callback returned, so these read the same field for groups.
     pub fn succeeded(&self) -> bool {
         match &self.inner {
-            Some(inner) => match &inner.completion_type {
-                CompletionType::Group(g) => {
-                    g.inner.outstanding.load(Ordering::SeqCst) == 0
-                        && g.inner.result.get().is_some_and(|e| e.is_none())
-                }
-                _ => inner.result.get().is_some_and(|e| e.is_none()),
-            },
+            Some(inner) => inner.result.get().is_some_and(|e| e.is_none()),
             None => true,
         }
     }
@@ -457,16 +560,7 @@ impl Completion {
 
     pub fn get_error(&self) -> Option<CompletionError> {
         match &self.inner {
-            Some(inner) => {
-                match &inner.completion_type {
-                    CompletionType::Group(g) => {
-                        // For groups, check the group's cached result field
-                        // (set when the last completion finishes)
-                        g.inner.result.get().and_then(|res| *res)
-                    }
-                    _ => inner.result.get().and_then(|res| *res),
-                }
-            }
+            Some(inner) => inner.result.get().and_then(|res| *res),
             None => None,
         }
     }
@@ -474,10 +568,7 @@ impl Completion {
     /// Checks if the Completion completed or errored
     pub fn finished(&self) -> bool {
         match &self.inner {
-            Some(inner) => match &inner.completion_type {
-                CompletionType::Group(g) => g.inner.outstanding.load(Ordering::SeqCst) == 0,
-                _ => inner.result.get().is_some(),
-            },
+            Some(inner) => inner.result.get().is_some(),
             None => true,
         }
     }
@@ -508,6 +599,7 @@ impl Completion {
 
     fn callback(&self, result: Result<i32, CompletionError>) {
         let inner = self.get_inner();
+        let mut published = None;
         inner.result.get_or_init(|| {
             // Run the type-specific callback. For ReadCompletion, this returns
             // an optional error detected by the callback (e.g., short read).
@@ -534,34 +626,23 @@ impl Completion {
 
             // Use callback error if present, otherwise use the original IO error
             let final_error = callback_error.or_else(|| result.err());
-
-            if let Some(group) = inner.parent.get() {
-                // Capture first error in group
-                if let Some(err) = final_error {
-                    let _ = group.result.set(Some(err));
-                }
-                let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
-                if prev > 1 {
-                    // progress wake so the waiter keeps driving io.step,
-                    // If prev > 1, there are still children outstanding after this one.
-                    if let Some(group_completion) = group.self_completion.get() {
-                        group_completion.wake();
-                    }
-                }
-                // If this was the last completion in the group, trigger the group's callback
-                // which will recursively call this same callback() method to notify parents
-                if prev == 1 {
-                    // Set result to Some(None) on success so succeeded() returns true
-                    let _ = group.result.set(None);
-                    if let Some(group_completion) = group.self_completion.get() {
-                        let group_result = group.result.get().and_then(|e| *e);
-                        group_completion.callback(group_result.map_or(Ok(0), Err));
-                    }
-                }
-            }
-
+            published = Some(final_error);
             final_error
         });
+        // Only the call that published the result tells the group, after the
+        // result is visible and outside this completion's callback.
+        if let Some(final_error) = published {
+            #[cfg(any(test, feature = "completion_test_hooks"))]
+            registration_hooks::after_result_published();
+            let notify = {
+                let mut link = inner.link.lock();
+                link.published = true;
+                link.claim()
+            };
+            if let Some(group) = notify {
+                group.child_finished(final_error);
+            }
+        }
         // call the waker regardless
         inner.context.wake();
     }
@@ -576,16 +657,26 @@ impl Completion {
         }
     }
 
-    /// Link this completion to a group completion (internal use only)
-    fn link_internal(&mut self, group: &Completion) {
-        let group_inner = match &group.get_inner().completion_type {
-            CompletionType::Group(g) => &g.inner,
-            _ => panic!("link_internal() requires a group completion"),
+    /// Registers this completion as a child of `group` (internal use only).
+    /// If its result was already published, the group is told here.
+    fn link_internal(&self, group: &Arc<GroupCompletionInner>) {
+        let Some(inner) = &self.inner else {
+            // A yield completion is always finished, successfully.
+            group.child_finished(None);
+            return;
         };
-
-        // Set the parent (can only be set once)
-        if self.get_inner().parent.set(group_inner.clone()).is_err() {
-            panic!("completion can only be linked once");
+        let notify = {
+            let mut link = inner.link.lock();
+            turso_assert!(link.parent.is_none(), "completion can only be linked once");
+            link.parent = Some(group.clone());
+            link.claim()
+        };
+        if let Some(group) = notify {
+            let result = inner
+                .result
+                .get()
+                .expect("a published completion has its result set");
+            group.child_finished(*result);
         }
     }
 }
@@ -881,7 +972,9 @@ mod tests {
 
         let group = group.build();
 
-        // Group should immediately fail with the error
+        // c2's IO is still running; ending now would let a caller free its buffers under it.
+        assert!(!group.finished());
+        c2.complete(0);
         assert!(group.finished());
         assert!(!group.succeeded());
         assert_eq!(group.get_error(), Some(CompletionError::Aborted));
@@ -1519,5 +1612,418 @@ mod tests {
         assert!(group.finished());
         assert!(group.succeeded());
         assert_eq!(calls(), (1, 1, 1));
+    }
+
+    fn group_outstanding(group: &Completion) -> usize {
+        match &group.get_inner().completion_type {
+            CompletionType::Group(g) => g.inner.outstanding.load(Ordering::SeqCst),
+            _ => unreachable!("not a group completion"),
+        }
+    }
+
+    /// Counts the calls of every callback it hands out.
+    #[derive(Clone, Default)]
+    struct Calls(Arc<AtomicUsize>);
+
+    impl Calls {
+        fn write(&self) -> Completion {
+            let calls = self.0.clone();
+            Completion::new_write(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+
+        fn group(&self) -> CompletionGroup {
+            let calls = self.0.clone();
+            CompletionGroup::new(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+
+        fn get(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    const RENDEZVOUS: std::time::Duration = std::time::Duration::from_secs(10);
+    const CHILD: &str = "TURSO_COMPLETION_REGISTRATION_CHILD";
+
+    /// One thread pauses until the driving thread resumes it. Both sides give
+    /// up after `RENDEZVOUS` with the rendezvous name, so a broken order fails
+    /// instead of hanging.
+    fn rendezvous(name: &'static str) -> (Paused, Driver) {
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        (
+            Paused {
+                name,
+                paused: paused_tx,
+                resume: resume_rx,
+            },
+            Driver {
+                name,
+                paused: paused_rx,
+                resume: resume_tx,
+            },
+        )
+    }
+
+    struct Paused {
+        name: &'static str,
+        paused: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Paused {
+        fn pause(&self) {
+            self.paused
+                .send(())
+                .expect("the driver outlives the rendezvous");
+            if self.resume.recv_timeout(RENDEZVOUS).is_err() {
+                panic!("{}: never resumed", self.name);
+            }
+        }
+    }
+
+    struct Driver {
+        name: &'static str,
+        paused: std::sync::mpsc::Receiver<()>,
+        resume: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Driver {
+        fn wait_paused(&self) {
+            if self.paused.recv_timeout(RENDEZVOUS).is_err() {
+                panic!("{}: never paused", self.name);
+            }
+        }
+
+        fn resume(&self) {
+            self.resume
+                .send(())
+                .expect("the paused thread waits for resume");
+        }
+    }
+
+    /// The other order of the registration race: the child's result is
+    /// already visible when build registers it, but the completing thread has
+    /// not reconciled with the group yet. Build must not count the child, and
+    /// the completing thread must count it once when it resumes.
+    #[test]
+    fn completion_group_registration_before_reconcile_counts_the_child_once() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(20));
+            return;
+        }
+        let (child_calls, group_calls) = (Calls::default(), Calls::default());
+        let child = child_calls.write();
+        let mut group = group_calls.group();
+        group.add(&child);
+        let (paused, driver) = rendezvous("completion_group_reconcile_rendezvous");
+        let peer = {
+            let child = child.clone();
+            std::thread::spawn(move || {
+                let mut published = 0;
+                registration_hooks::with_hook(
+                    move |point| {
+                        if point == registration_hooks::HookPoint::AfterResultPublished {
+                            published += 1;
+                            if published == 1 {
+                                paused.pause();
+                            }
+                        }
+                    },
+                    || child.complete(0),
+                );
+            })
+        };
+        driver.wait_paused();
+        assert!(child.finished(), "the child's result is published");
+        let group = group.build();
+        assert!(
+            !group.finished(),
+            "build counted a child whose completer had not reconciled"
+        );
+        assert_eq!(group_outstanding(&group), 1);
+        driver.resume();
+        peer.join().expect("the completing thread finished");
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert_eq!(group_outstanding(&group), 0);
+        assert_eq!((child_calls.get(), group_calls.get()), (1, 1));
+    }
+
+    /// Every child finishes after its registration but before build gives up
+    /// its own count. The group must not finish until build is done, and then
+    /// exactly once.
+    #[test]
+    fn completion_group_children_finishing_before_build_ends_finish_it_once() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(20));
+            return;
+        }
+        let (child_calls, group_calls) = (Calls::default(), Calls::default());
+        let (c0, c1) = (child_calls.write(), child_calls.write());
+        let mut group = group_calls.group();
+        group.add(&c0);
+        group.add(&c1);
+        let (paused, driver) = rendezvous("completion_group_build_end_rendezvous");
+        let peer = {
+            let (c0, c1, group_calls) = (c0.clone(), c1.clone(), group_calls.clone());
+            std::thread::spawn(move || {
+                driver.wait_paused();
+                c0.complete(0);
+                c1.complete(0);
+                let group_calls_while_building = group_calls.get();
+                driver.resume();
+                group_calls_while_building
+            })
+        };
+        let mut registered = 0;
+        let group = registration_hooks::with_hook(
+            move |point| {
+                if point == registration_hooks::HookPoint::AfterChildRegister {
+                    registered += 1;
+                    if registered == 2 {
+                        paused.pause();
+                    }
+                }
+            },
+            || group.build(),
+        );
+        let group_calls_while_building = peer.join().expect("the peer finished");
+        assert_eq!(
+            group_calls_while_building, 0,
+            "the group finished before build ended"
+        );
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert_eq!(group_outstanding(&group), 0);
+        assert_eq!((child_calls.get(), group_calls.get()), (2, 1));
+    }
+
+    /// A child that failed before build no longer ends the group early: the
+    /// others are still registered, the group waits for their IO and then
+    /// finishes once with the first error, including a read callback's.
+    #[test]
+    fn completion_group_failed_child_does_not_skip_pending_children() {
+        let group_calls = Calls::default();
+        let short_read = CompletionError::ShortRead {
+            page_idx: 1,
+            expected: 4096,
+            actual: 0,
+        };
+        let failed =
+            Completion::new_read(Arc::new(crate::Buffer::new_temporary(4096)), move |_| {
+                Some(short_read)
+            });
+        failed.complete(0);
+        let pending = Completion::new_write(|_| {});
+        let mut group = group_calls.group();
+        group.add(&failed);
+        group.add(&pending);
+        let group = group.build();
+        assert!(
+            !group.finished(),
+            "the group finished while a child's IO was pending"
+        );
+        assert_eq!(group_outstanding(&group), 1);
+        assert_eq!(group_calls.get(), 0);
+        pending.error(CompletionError::ShortWrite);
+        assert!(group.finished());
+        assert_eq!(group.get_error(), Some(short_read), "the first error wins");
+        assert_eq!(group_outstanding(&group), 0);
+        assert_eq!(group_calls.get(), 1);
+    }
+
+    /// Finishing a child again (complete, error or abort) before or after its
+    /// registration changes nothing: its group counts it once, with its first
+    /// result, and a finished group ignores being finished again.
+    #[test]
+    fn completion_group_counts_a_repeatedly_finished_child_once() {
+        let (child_calls, group_calls) = (Calls::default(), Calls::default());
+        let (before, during, after) = (
+            child_calls.write(),
+            child_calls.write(),
+            child_calls.write(),
+        );
+        before.complete(0);
+        before.abort();
+        let mut group = group_calls.group();
+        group.add(&before);
+        group.add(&during);
+        group.add(&after);
+        let group = group.build();
+        before.abort();
+        during.abort();
+        during.abort();
+        during.complete(0);
+        assert!(!group.finished());
+        assert_eq!(group_outstanding(&group), 1);
+        after.complete(0);
+        after.error(CompletionError::ShortWrite);
+        group.complete(0);
+        assert!(group.finished());
+        assert_eq!(group.get_error(), Some(CompletionError::Aborted));
+        assert_eq!(group_outstanding(&group), 0);
+        assert_eq!((child_calls.get(), group_calls.get()), (3, 1));
+    }
+
+    /// A group's finished, succeeded and error state come from one published
+    /// result: inside its callback the group is not finished yet, and once
+    /// the callback returned it reports the callback's result.
+    #[test]
+    fn completion_group_is_not_finished_until_its_callback_returned() {
+        type Seen = (
+            Result<i32, CompletionError>,
+            bool,
+            bool,
+            Option<CompletionError>,
+        );
+        let slot: Arc<OnceLock<Completion>> = Arc::new(OnceLock::new());
+        let seen: Arc<Mutex<Option<Seen>>> = Arc::new(Mutex::new(None));
+        let mut group = CompletionGroup::new({
+            let (slot, seen) = (slot.clone(), seen.clone());
+            move |result| {
+                let group = slot.get().expect("the test stores the group after build");
+                *seen.lock() = Some((
+                    result,
+                    group.finished(),
+                    group.succeeded(),
+                    group.get_error(),
+                ));
+            }
+        });
+        let child = Completion::new_write(|_| {});
+        group.add(&child);
+        let group = group.build();
+        slot.set(group.clone()).expect("stored once");
+        child.error(CompletionError::ShortWrite);
+        assert_eq!(
+            *seen.lock(),
+            Some((Err(CompletionError::ShortWrite), false, false, None))
+        );
+        assert!(group.finished());
+        assert!(!group.succeeded());
+        assert_eq!(group.get_error(), Some(CompletionError::ShortWrite));
+    }
+
+    /// A completion belongs to one group only, even after it finished: build
+    /// registers finished children too.
+    #[test]
+    #[should_panic(expected = "completion can only be linked once")]
+    fn completion_group_rejects_a_child_already_in_another_group() {
+        let child = Completion::new_write(|_| {});
+        child.complete(0);
+        let mut first = CompletionGroup::new(|_| {});
+        first.add(&child);
+        assert!(first.build().finished());
+        let mut second = CompletionGroup::new(|_| {});
+        second.add(&child);
+        let _ = second.build();
+    }
+
+    /// A nested group that finishes while its parent's build is about to
+    /// register it is counted once, like any other child.
+    #[test]
+    fn completion_group_nested_group_finishing_during_registration_is_counted() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(20));
+            return;
+        }
+        let (inner_calls, outer_calls) = (Calls::default(), Calls::default());
+        let leaf = Completion::new_write(|_| {});
+        let mut inner = inner_calls.group();
+        inner.add(&leaf);
+        let inner = inner.build();
+        let sibling = Completion::new_write(|_| {});
+        let mut outer = outer_calls.group();
+        outer.add(&inner);
+        outer.add(&sibling);
+        let (paused, driver) = rendezvous("completion_group_nested_rendezvous");
+        let peer = {
+            let (leaf, inner) = (leaf.clone(), inner.clone());
+            std::thread::spawn(move || {
+                driver.wait_paused();
+                leaf.complete(0);
+                let inner_finished = inner.finished();
+                driver.resume();
+                inner_finished
+            })
+        };
+        let mut seen = 0;
+        let outer = registration_hooks::with_before_child_register(
+            move || {
+                seen += 1;
+                if seen == 1 {
+                    paused.pause();
+                }
+            },
+            || outer.build(),
+        );
+        assert!(
+            peer.join().expect("the peer finished"),
+            "completion_group_nested_rendezvous: the nested group did not finish while paused"
+        );
+        assert!(!outer.finished());
+        assert_eq!(group_outstanding(&outer), 1);
+        sibling.complete(0);
+        assert!(outer.finished());
+        assert!(outer.succeeded());
+        assert_eq!(group_outstanding(&outer), 0);
+        assert_eq!((inner_calls.get(), outer_calls.get()), (1, 1));
+    }
+
+    /// Cancelling a group's children while build is registering them, or
+    /// before build, finishes the group once with the abort after every
+    /// child is counted.
+    #[test]
+    fn completion_group_children_cancelled_during_build_finish_it_once() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(20));
+            return;
+        }
+        let (child_calls, group_calls) = (Calls::default(), Calls::default());
+        let (c0, c1) = (child_calls.write(), child_calls.write());
+        let mut group = group_calls.group();
+        group.add(&c0);
+        group.add(&c1);
+        let (paused, driver) = rendezvous("completion_group_cancel_rendezvous");
+        let peer = {
+            let children = [c0.clone(), c1.clone()];
+            std::thread::spawn(move || {
+                driver.wait_paused();
+                for child in &children {
+                    child.abort();
+                }
+                driver.resume();
+            })
+        };
+        let mut seen = 0;
+        let group = registration_hooks::with_before_child_register(
+            move || {
+                seen += 1;
+                if seen == 2 {
+                    paused.pause();
+                }
+            },
+            || group.build(),
+        );
+        peer.join().expect("the peer finished");
+        assert!(group.finished());
+        assert_eq!(group.get_error(), Some(CompletionError::Aborted));
+        assert_eq!(group_outstanding(&group), 0);
+        assert_eq!((child_calls.get(), group_calls.get()), (2, 1));
+
+        let cancelled_calls = Calls::default();
+        let mut cancelled = cancelled_calls.group();
+        cancelled.add(&Completion::new_write(|_| {}));
+        cancelled.add(&Completion::new_write(|_| {}));
+        cancelled.cancel();
+        let cancelled = cancelled.build();
+        assert!(cancelled.finished());
+        assert_eq!(cancelled.get_error(), Some(CompletionError::Aborted));
+        assert_eq!(group_outstanding(&cancelled), 0);
+        assert_eq!(cancelled_calls.get(), 1);
     }
 }
