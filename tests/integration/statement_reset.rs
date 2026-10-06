@@ -157,7 +157,16 @@ fn plain_insert_step_to_done_commits(tmp_db: TempDatabase) -> anyhow::Result<()>
 }
 
 #[test]
-fn dropping_explicit_commit_waiting_on_io_rolls_back_transaction() -> anyhow::Result<()> {
+fn dropping_explicit_commit_after_its_append_is_submitted_finishes_it() -> anyhow::Result<()> {
+    fn values(conn: &Arc<turso_core::Connection>) -> anyhow::Result<Vec<i64>> {
+        let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x")?;
+        let mut values = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            values.push(row.get::<i64>(0)?);
+            Ok(())
+        })?;
+        Ok(values)
+    }
     let io = Arc::new(QueuedIo::new());
     let db = Database::open_file(io, "queued-explicit-commit-drop.db")?;
     let conn = db.connect()?;
@@ -170,16 +179,13 @@ fn dropping_explicit_commit_waiting_on_io_rolls_back_transaction() -> anyhow::Re
         let mut commit = conn.prepare("COMMIT")?;
         assert!(matches!(commit.step()?, StepResult::IO));
     }
+    // A submitted append may be durable: teardown finishes it, never discards it (Louhi H D3).
+    assert!(!conn.is_in_write_tx());
+    assert!(conn.get_auto_commit());
+    assert_eq!(values(&db.connect()?)?, vec![1]);
 
     conn.execute("INSERT INTO t VALUES (2)")?;
-
-    let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x")?;
-    let mut values = Vec::new();
-    stmt.run_with_row_callback(|row| {
-        values.push(row.get::<i64>(0)?);
-        Ok(())
-    })?;
-    assert_eq!(values, vec![2]);
+    assert_eq!(values(&conn)?, vec![1, 2]);
     Ok(())
 }
 
