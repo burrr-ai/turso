@@ -139,6 +139,8 @@ pub use io::{
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{Statement, StatementStatusCounter};
+#[cfg(any(test, feature = "commit_test_hooks"))]
+pub use storage::pager::commit_hooks;
 pub use storage::shared_page_cache::{
     SharedPageCache, SharedPageCacheAccounting, SharedPageCacheCharge, SharedPageCacheChargeKind,
     SharedPageCacheChargeState, SharedPageCacheCreateError, SharedPageCacheLookup,

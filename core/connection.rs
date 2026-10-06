@@ -3044,6 +3044,16 @@ impl Connection {
         self.progress_handler.should_interrupt(vm_steps)
     }
 
+    /// Installs `hook` at this connection's commit pause points (see
+    /// [`crate::commit_hooks`]) until the returned guard is dropped.
+    #[cfg(any(test, feature = "commit_test_hooks"))]
+    pub fn install_commit_test_hook(
+        &self,
+        hook: crate::commit_hooks::CommitHook,
+    ) -> crate::commit_hooks::CommitHookGuard {
+        crate::commit_hooks::CommitHookGuard::install(self.pager.load_full(), hook)
+    }
+
     /// Request interruption of currently running root statements on this connection.
     /// If no root statement is active, the request is ignored to match SQLite semantics.
     pub fn interrupt(&self) {

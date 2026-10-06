@@ -39,6 +39,10 @@ test_helper = []
 # Test-only pause points before and after a CompletionGroup registers a child and after a
 # completion publishes its result; off by default and implies nothing else.
 completion_test_hooks = []
+# Test-only pause points in a WAL commit (before the commit append is submitted,
+# after it is published, at an auto-checkpoint IO yield); off by default and
+# implies nothing else.
+commit_test_hooks = []
 bench = []
 nanosecond-bench = ["bench"]
 fts = ["dep:tantivy"]

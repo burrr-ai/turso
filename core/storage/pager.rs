@@ -1015,6 +1015,9 @@ enum CommitState {
     WaitBatchedReads { db_size: u32 },
     /// Collect pages (now all available) and prepare WAL frames.
     PrepareFrames { db_size: u32 },
+    /// Frames are prepared; the commit append is submitted next. Its own
+    /// state so nothing is prepared twice if a test hook pauses before it.
+    SubmitFrames,
     /// All frames prepared, writes are in flight
     WaitWrites,
     /// Writes are complete, wait for WAL sync to complete
@@ -1111,6 +1114,9 @@ struct CommitInfo {
     page_sources: Vec<PageSource>,
     page_source_cursor: usize,
     prepared_frames: Vec<PreparedFrames>,
+    /// The BeforeIrreversibleCommit test hook already ran for this commit.
+    #[cfg(any(test, feature = "commit_test_hooks"))]
+    submit_hook_seen: bool,
 }
 
 /// Represents a dirty page that will be committed to the log.
@@ -1130,6 +1136,10 @@ impl CommitInfo {
         self.page_sources.clear();
         self.prepared_frames.clear();
         self.page_source_cursor = 0;
+        #[cfg(any(test, feature = "commit_test_hooks"))]
+        {
+            self.submit_hook_seen = false;
+        }
     }
 
     /// Clear and reserve space for n pages in each vector.
@@ -1394,9 +1404,67 @@ pub struct Pager {
     #[cfg(target_vendor = "apple")]
     sync_type: AtomicFileSyncType,
     checkpoint_observer: Option<Arc<dyn CheckpointObserver>>,
+    /// Test-only commit pause points of this connection's pager.
+    #[cfg(any(test, feature = "commit_test_hooks"))]
+    commit_hook: RwLock<Option<commit_hooks::CommitHook>>,
 }
 
 assert_send_sync!(Pager);
+
+/// Test-only pause points in a WAL commit, installed per connection with
+/// `Connection::install_commit_test_hook`. Every point is reached with no
+/// pager lock held, so a hook may block the committing thread.
+#[cfg(any(test, feature = "commit_test_hooks"))]
+pub mod commit_hooks {
+    use super::Pager;
+    use crate::sync::Arc;
+    use crate::turso_assert;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CommitHookPoint {
+        /// The commit's WAL frames are prepared and about to be submitted.
+        /// Returning [`HookAction::Yield`] here (honored once per commit)
+        /// returns control to the caller before the submit; stepping again
+        /// submits the same prepared frames.
+        BeforeIrreversibleCommit,
+        /// The commit was published to the WAL: it is durable and visible.
+        AfterCommitPublication,
+        /// The commit's auto-checkpoint is returning pending IO to the caller.
+        AutoCheckpointIoYield,
+    }
+
+    /// What a hook asks for. Only `BeforeIrreversibleCommit` can yield; the
+    /// other points only report.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HookAction {
+        Continue,
+        Yield,
+    }
+
+    pub type CommitHook = Arc<dyn Fn(CommitHookPoint) -> HookAction + Send + Sync>;
+
+    /// Keeps the hook installed until dropped.
+    pub struct CommitHookGuard {
+        pager: Arc<Pager>,
+    }
+
+    impl CommitHookGuard {
+        pub(crate) fn install(pager: Arc<Pager>, hook: CommitHook) -> Self {
+            let previous = pager.commit_hook.write().replace(hook);
+            turso_assert!(
+                previous.is_none(),
+                "a connection has one commit test hook at a time"
+            );
+            Self { pager }
+        }
+    }
+
+    impl Drop for CommitHookGuard {
+        fn drop(&mut self) {
+            *self.pager.commit_hook.write() = None;
+        }
+    }
+}
 
 #[cfg(not(feature = "omit_autovacuum"))]
 pub struct VacuumState {
@@ -1599,6 +1667,8 @@ impl Pager {
                 prepared_frames: Vec::new(),
                 page_sources: Vec::new(),
                 page_source_cursor: 0,
+                #[cfg(any(test, feature = "commit_test_hooks"))]
+                submit_hook_seen: false,
             }),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
@@ -1627,7 +1697,27 @@ impl Pager {
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             checkpoint_observer,
+            #[cfg(any(test, feature = "commit_test_hooks"))]
+            commit_hook: RwLock::new(None),
         })
+    }
+
+    #[cfg(any(test, feature = "commit_test_hooks"))]
+    fn run_commit_hook(&self, point: commit_hooks::CommitHookPoint) -> commit_hooks::HookAction {
+        // Cloned out so the hook runs with no pager lock held.
+        let hook = self.commit_hook.read().clone();
+        hook.map_or(commit_hooks::HookAction::Continue, |hook| hook(point))
+    }
+
+    /// Runs the BeforeIrreversibleCommit hook once per commit; true if it
+    /// asked to yield before the commit append is submitted.
+    #[cfg(any(test, feature = "commit_test_hooks"))]
+    fn yield_before_irreversible_commit(&self) -> bool {
+        if std::mem::replace(&mut self.commit_info.write().submit_hook_seen, true) {
+            return false;
+        }
+        self.run_commit_hook(commit_hooks::CommitHookPoint::BeforeIrreversibleCommit)
+            == commit_hooks::HookAction::Yield
     }
 
     /// Get the sync type setting.
@@ -2847,7 +2937,13 @@ impl Pager {
                         false,
                     );
                     match checkpoint_result {
-                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::IO(io)) => {
+                            #[cfg(any(test, feature = "commit_test_hooks"))]
+                            let _ = self.run_commit_hook(
+                                commit_hooks::CommitHookPoint::AutoCheckpointIoYield,
+                            );
+                            return Ok(IOResult::IO(io));
+                        }
                         Ok(IOResult::Done(_)) => complete_commit(),
                         Err(err) => {
                             tracing::debug!("auto-checkpoint failed: {err}");
@@ -3989,6 +4085,16 @@ impl Pager {
                         );
                         return Ok(IOResult::Done(()));
                     }
+                    commit_info.state = CommitState::SubmitFrames;
+                }
+                CommitState::SubmitFrames => {
+                    #[cfg(any(test, feature = "commit_test_hooks"))]
+                    {
+                        if self.yield_before_irreversible_commit() {
+                            io_yield_one!(Completion::new_yield());
+                        }
+                    }
+                    let mut commit_info = self.commit_info.write();
                     // Submit all WAL writes
                     let wal_file = wal.wal_file()?;
                     let mut batch = WriteBatch::new(wal_file);
@@ -4088,6 +4194,10 @@ impl Pager {
                     if need_checkpoint {
                         commit_info.state = CommitState::AutoCheckpoint;
                     }
+                    drop(commit_info);
+                    #[cfg(any(test, feature = "commit_test_hooks"))]
+                    let _ =
+                        self.run_commit_hook(commit_hooks::CommitHookPoint::AfterCommitPublication);
                     return Ok(IOResult::Done(()));
                 }
                 CommitState::AutoCheckpoint => panic!("checkpoint must be handled externally"),
@@ -6070,5 +6180,345 @@ mod checkpoint_phase_tests {
             ),
             "resuming after the post-sync gap must install a valid durable backfill proof"
         );
+    }
+}
+
+/// Issue #124 B: an interrupt that reaches a COMMIT after its frames were
+/// published to the WAL, while the commit's auto-checkpoint waits on IO, must
+/// not roll the published commit back.
+#[cfg(test)]
+mod commit_finality_tests {
+    use super::commit_hooks::{CommitHookPoint, HookAction};
+    use super::*;
+    use crate::io::test_child::run_current_test_in_child;
+    use crate::io::{File, FileId};
+    use crate::{
+        Clock, Database, MemoryIO, MonotonicInstant, Statement, StepResult, WallClockInstant,
+    };
+
+    const DB_PATH: &str = "issue-124-commit-finality.db";
+    /// ~3000-byte rows fill a leaf page each, so one commit of this many rows
+    /// writes more WAL frames than the default 1000-frame auto-checkpoint
+    /// threshold.
+    const ROWS: i64 = 1100;
+    const CHILD: &str = "TURSO_COMMIT_FINALITY_CHILD";
+
+    type HeldResult = Arc<std::sync::OnceLock<std::result::Result<i32, CompletionError>>>;
+
+    /// Writes to one file, held while armed: the bytes are written at once,
+    /// the completion finishes only when the test releases it.
+    struct HeldWrites {
+        path: &'static str,
+        armed: AtomicBool,
+        writes: Mutex<Vec<(Completion, HeldResult)>>,
+    }
+
+    impl HeldWrites {
+        fn new(path: &'static str) -> Self {
+            Self {
+                path,
+                armed: AtomicBool::new(false),
+                writes: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The completion to give the real write in place of `c`.
+        fn hold(&self, c: &Completion) -> Completion {
+            let result: HeldResult = Arc::new(std::sync::OnceLock::new());
+            self.writes.lock().push((c.clone(), result.clone()));
+            Completion::new_write(move |res| {
+                let _ = result.set(res);
+            })
+        }
+
+        fn held(&self) -> usize {
+            self.writes.lock().len()
+        }
+
+        /// Disarms and finishes every held write: with its real result, or
+        /// with `failure` when given.
+        fn release_with(&self, failure: Option<CompletionError>) -> usize {
+            self.armed.store(false, Ordering::SeqCst);
+            let writes = std::mem::take(&mut *self.writes.lock());
+            for (c, result) in &writes {
+                let real = *result.get().expect("the real write finished");
+                match failure.map_or(real, Err) {
+                    Ok(n) => c.complete(n),
+                    Err(err) => c.error(err),
+                }
+            }
+            writes.len()
+        }
+
+        fn release(&self) -> usize {
+            self.release_with(None)
+        }
+    }
+
+    struct HoldWritesIo {
+        inner: Arc<MemoryIO>,
+        held: Arc<HeldWrites>,
+    }
+
+    impl Clock for HoldWritesIo {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for HoldWritesIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            let inner = self.inner.open_file(path, flags, direct)?;
+            Ok(Arc::new(HoldWritesFile {
+                inner,
+                held: (path == self.held.path).then(|| self.held.clone()),
+            }))
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn step(&self) -> Result<()> {
+            self.inner.step()
+        }
+
+        fn file_id(&self, path: &str) -> Result<FileId> {
+            self.inner.file_id(path)
+        }
+    }
+
+    struct HoldWritesFile {
+        inner: Arc<dyn File>,
+        /// Set for the held file only.
+        held: Option<Arc<HeldWrites>>,
+    }
+
+    impl HoldWritesFile {
+        fn armed(&self) -> Option<&HeldWrites> {
+            self.held
+                .as_deref()
+                .filter(|held| held.armed.load(Ordering::SeqCst))
+        }
+    }
+
+    impl File for HoldWritesFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            let Some(held) = self.armed() else {
+                return self.inner.pwrite(pos, buffer, c);
+            };
+            // The real write finishes the stand-in; the caller waits on `c`.
+            let _stand_in = self.inner.pwrite(pos, buffer, held.hold(&c))?;
+            Ok(c)
+        }
+
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> Result<Completion> {
+            let Some(held) = self.armed() else {
+                return self.inner.pwritev(pos, buffers, c);
+            };
+            let _stand_in = self.inner.pwritev(pos, buffers, held.hold(&c))?;
+            Ok(c)
+        }
+
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    /// A database whose writes to `held_path` can be held, with a table `t`.
+    fn open_with_held_writes(
+        held_path: &'static str,
+    ) -> (Arc<Database>, Arc<Connection>, Arc<dyn IO>, Arc<HeldWrites>) {
+        let held = Arc::new(HeldWrites::new(held_path));
+        let io: Arc<dyn IO> = Arc::new(HoldWritesIo {
+            inner: Arc::new(MemoryIO::new()),
+            held: held.clone(),
+        });
+        let db = Database::open_file(io.clone(), DB_PATH).expect("the database opens");
+        let conn = db.connect().expect("a connection");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+            .expect("the table is created");
+        (db, conn, io, held)
+    }
+
+    /// Opens a transaction whose commit crosses the auto-checkpoint threshold.
+    fn begin_large_transaction(conn: &Arc<Connection>) {
+        conn.execute("BEGIN").expect("the transaction begins");
+        for _ in 0..ROWS {
+            conn.execute("INSERT INTO t(v) VALUES (randomblob(3000))")
+                .expect("a row is inserted");
+        }
+    }
+
+    /// Arms `held` and steps `stmt` until it waits on a held write.
+    fn step_until_held(stmt: &mut Statement, io: &Arc<dyn IO>, held: &HeldWrites) {
+        held.armed.store(true, Ordering::SeqCst);
+        loop {
+            match stmt.step().expect("the statement steps") {
+                StepResult::IO if held.held() > 0 => return,
+                StepResult::IO => io.step().expect("the IO steps"),
+                other => panic!(
+                    "commit_finality_setup: the statement returned {other:?} before a held write"
+                ),
+            }
+        }
+    }
+
+    /// The commit is published, auto-checkpointing, past its WAL write lock,
+    /// and the connection still reports its write transaction.
+    fn assert_published_and_checkpointing(conn: &Arc<Connection>) -> Arc<Pager> {
+        let pager = conn.pager.load_full();
+        assert_eq!(
+            pager.commit_info.read().state,
+            CommitState::AutoCheckpoint,
+            "the commit is published and auto-checkpointing"
+        );
+        assert!(pager.is_checkpointing());
+        assert!(
+            !pager.holds_write_lock(),
+            "the commit already released the WAL write lock"
+        );
+        assert!(
+            matches!(conn.get_tx_state(), TransactionState::Write { .. }),
+            "the connection still reports its write transaction"
+        );
+        pager
+    }
+
+    /// Steps `stmt` until it stops waiting on IO, driving `io` meanwhile.
+    fn finish(stmt: &mut Statement, io: &Arc<dyn IO>) -> Result<StepResult> {
+        loop {
+            match stmt.step()? {
+                StepResult::IO => io.step()?,
+                other => return Ok(other),
+            }
+        }
+    }
+
+    fn count_rows(conn: &Arc<Connection>, io: &Arc<dyn IO>) -> i64 {
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM t")
+            .expect("count prepares");
+        match finish(&mut stmt, io).expect("count runs") {
+            StepResult::Row => stmt
+                .row()
+                .expect("count returns a row")
+                .get::<i64>(0)
+                .expect("count is an integer"),
+            other => panic!("count returned {other:?}"),
+        }
+    }
+
+    /// The hook sees the commit's pause points in order, yields once before
+    /// the append (the same commit then completes), and is gone once its
+    /// guard drops.
+    #[test]
+    fn commit_hook_reports_points_and_yields_once_before_the_append() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), "commit-hook-points.db").expect("the database opens");
+        let conn = db.connect().expect("a connection");
+        conn.execute("CREATE TABLE t(v)")
+            .expect("the table is created");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let guard = conn.install_commit_test_hook({
+            let seen = seen.clone();
+            Arc::new(move |point: CommitHookPoint| -> HookAction {
+                seen.lock().push(point);
+                match point {
+                    CommitHookPoint::BeforeIrreversibleCommit => HookAction::Yield,
+                    _ => HookAction::Continue,
+                }
+            })
+        });
+        let mut insert = conn
+            .prepare("INSERT INTO t VALUES (1)")
+            .expect("the insert prepares");
+        assert!(
+            matches!(insert.step(), Ok(StepResult::IO)),
+            "the first step stops before the commit append"
+        );
+        assert_eq!(*seen.lock(), [CommitHookPoint::BeforeIrreversibleCommit]);
+        assert_eq!(count_rows(&db.connect().expect("a reader"), &io), 0);
+        assert!(matches!(finish(&mut insert, &io), Ok(StepResult::Done)));
+        assert_eq!(
+            *seen.lock(),
+            [
+                CommitHookPoint::BeforeIrreversibleCommit,
+                CommitHookPoint::AfterCommitPublication
+            ]
+        );
+        drop(insert);
+        drop(guard);
+        conn.execute("INSERT INTO t VALUES (2)")
+            .expect("the next insert runs without a hook");
+        assert_eq!(seen.lock().len(), 2, "the dropped guard removed the hook");
+        assert_eq!(count_rows(&conn, &io), 2);
+    }
+
+    /// The pinned engine answers this interrupt by rolling the published
+    /// commit back, which releases the WAL write lock a second time and trips
+    /// `WalFile::end_write_tx`'s assertion. The commit must finish instead.
+    #[test]
+    fn interrupt_during_post_publication_auto_checkpoint_keeps_the_commit() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let (db, conn, io, held) = open_with_held_writes(DB_PATH);
+        begin_large_transaction(&conn);
+        let mut commit = conn.prepare("COMMIT").expect("the commit prepares");
+        step_until_held(&mut commit, &io, &held);
+        let pager = assert_published_and_checkpointing(&conn);
+
+        conn.interrupt();
+        assert!(
+            conn.is_interrupted(),
+            "the COMMIT is an active root statement, so the interrupt is taken"
+        );
+        assert!(held.release() > 0);
+
+        let result = finish(&mut commit, &io);
+        assert!(
+            matches!(result, Ok(StepResult::Done)),
+            "commit_finality_post_publication_interrupt: the published COMMIT must finish, got {result:?}"
+        );
+        drop(commit);
+        assert!(!pager.is_checkpointing());
+        assert_eq!(conn.get_tx_state(), TransactionState::None);
+        let reader = db.connect().expect("a reader");
+        assert_eq!(count_rows(&reader, &io), ROWS, "the published rows stay");
+        conn.execute("INSERT INTO t(v) VALUES (1)")
+            .expect("the connection writes again");
+        assert_eq!(count_rows(&reader, &io), ROWS + 1);
     }
 }

@@ -668,6 +668,65 @@ mod buffer_tests {
     }
 }
 
+/// Process isolation for tests whose failure mode is a wait that never ends.
+#[cfg(test)]
+pub(crate) mod test_child {
+    /// Re-runs the calling test alone in a child process bounded by `budget`,
+    /// so a wait that never returns ends the child, not this test thread.
+    pub(crate) fn run_current_test_in_child(child_env: &str, budget: std::time::Duration) {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let name = std::thread::current()
+            .name()
+            .expect("libtest names its test threads")
+            .to_string();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(child_env, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Drain both pipes while polling, so a chatty child never blocks on a
+        // full pipe and looks like a timeout.
+        let drain = |mut pipe: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = pipe.read_to_string(&mut text);
+                text
+            })
+        };
+        let stdout = drain(Box::new(child.stdout.take().unwrap()));
+        let stderr = drain(Box::new(child.stderr.take().unwrap()));
+        let deadline = Instant::now() + budget;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // The child has exited or was killed, so both pipes are closed.
+        let stdout = stdout.join().unwrap();
+        let stderr = stderr.join().unwrap();
+        let Some(status) = status else {
+            panic!("{name}: child exceeded its {budget:?} budget\n{stdout}{stderr}");
+        };
+        assert!(
+            status.success()
+                && stdout.contains("running 1 test")
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored"),
+            "{name}: child failed ({status})\n{stdout}{stderr}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod default_pwritev_tests {
     use super::*;
