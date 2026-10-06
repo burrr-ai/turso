@@ -7470,4 +7470,74 @@ mod commit_finality_tests {
         let reader = db.connect().expect("a reader");
         assert_eq!(count_rows(&reader, &io), ROWS, "the published rows stay");
     }
+
+    /// A RETURNING reset that starts the commit itself runs it like a step,
+    /// auto-checkpoint included; a failed checkpoint write it meets is given
+    /// up and recorded, and the commit stands.
+    #[test]
+    fn returning_reset_that_starts_the_commit_records_its_checkpoint_failure() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let wal = Arc::new(HeldWrites::new(WAL_PATH));
+        let db_writes = Arc::new(HeldWrites::new(DB_PATH));
+        let io: Arc<dyn IO> = Arc::new(HoldWritesIo {
+            inner: Arc::new(MemoryIO::new()),
+            held: wal,
+            failing: Some(db_writes.clone()),
+        });
+        let db = Database::open_file(io.clone(), DB_PATH).expect("the database opens");
+        let conn = db.connect().expect("a connection opens");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+            .expect("the table is created");
+        let values = vec!["(randomblob(3000))"; ROWS as usize].join(",");
+        let mut insert = conn
+            .prepare(format!("INSERT INTO t(v) VALUES {values} RETURNING id"))
+            .expect("the insert prepares");
+        loop {
+            match insert.step().expect("the insert steps") {
+                StepResult::Row => break,
+                StepResult::IO => io.step().expect("IO steps"),
+                other => panic!("expected a RETURNING row, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            insert.outcome_snapshot().phase,
+            crate::CommitPhase::NotPublished
+        );
+        // No commit IO is pending: the reset's own halt loop starts the
+        // commit and its checkpoint, and alone sees the failed write.
+        db_writes.armed.store(true, Ordering::SeqCst);
+
+        let (outcome, reset) = insert.reset_with_outcome();
+        let pager = conn.pager.load_full();
+        let checkpoint_writes = db_writes.ever_held.load(Ordering::SeqCst);
+        let checkpointing = pager.is_checkpointing();
+        let tx_state = conn.get_tx_state();
+        if checkpointing || tx_state != TransactionState::None {
+            // Read the leaked state first, then clean it up so that unwinding
+            // from the assertion below does not roll the published commit back.
+            pager.cleanup_after_auto_checkpoint_failure();
+            conn.set_tx_state(TransactionState::None);
+        }
+        assert!(checkpoint_writes > 0, "the reset started the checkpoint");
+        assert_eq!((checkpointing, tx_state), (false, TransactionState::None));
+        reset.expect("a given-up checkpoint is no reset error");
+        assert!(
+            matches!(outcome.phase, crate::CommitPhase::Published { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::Done));
+        assert!(
+            outcome
+                .checkpoint_failure
+                .as_deref()
+                .is_some_and(|err| err.contains("injected write failure while stepping IO")),
+            "returning_first_commit_checkpoint_failure: outcome={outcome:?}"
+        );
+        drop(insert);
+        let reader = db.connect().expect("a reader");
+        assert_eq!(count_rows(&reader, &io), ROWS, "the published rows stay");
+    }
 }
