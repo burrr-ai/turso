@@ -138,7 +138,10 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
-pub use statement::{Statement, StatementStatusCounter};
+pub use statement::{
+    CancelObserved, CommitPhase, RootTerminal, Statement, StatementOutcome, StatementStatusCounter,
+    TxnIdentity,
+};
 #[cfg(any(test, feature = "commit_test_hooks"))]
 pub use storage::pager::commit_hooks;
 pub use storage::shared_page_cache::{
@@ -1755,6 +1758,9 @@ impl Database {
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
+            generation: connection::next_connection_generation(),
+            transaction_generation: AtomicU64::new(0),
+            root_generation: AtomicU64::new(0),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);

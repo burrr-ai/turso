@@ -708,6 +708,12 @@ pub trait Wal: Debug + Send + Sync {
     /// all changes were stored locally.
     fn finish_append_frames_commit(&self) -> Result<()>;
 
+    /// The WAL transaction count this connection's last published commit
+    /// reached, when the implementation tracks one.
+    fn last_commit_transaction_count(&self) -> Option<u64> {
+        None
+    }
+
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(&self, pager: &Pager, mode: CheckpointMode)
         -> Result<IOResult<CheckpointResult>>;
@@ -3950,6 +3956,10 @@ impl Wal for WalFile {
         });
         self.has_unpublished_frames.store(false, Ordering::Release);
         Ok(())
+    }
+
+    fn last_commit_transaction_count(&self) -> Option<u64> {
+        Some(self.transaction_count.load(Ordering::Acquire))
     }
 
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {

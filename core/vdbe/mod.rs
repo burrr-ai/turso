@@ -65,10 +65,11 @@ use smallvec::SmallVec;
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{
-    storage::pager::{CommitFinality, Pager},
+    storage::pager::{CommitFinality, CommitPublication, Pager},
     translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, ImmutableRecord, Value},
     vdbe::{builder::CursorType, insn::Insn},
+    CancelObserved,
 };
 use crate::{
     AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, Statement, SyncMode,
@@ -622,6 +623,22 @@ impl Default for VacuumOpState {
 }
 
 /// The program state describes the environment in which the program executes.
+/// What one execution observed about its commit; read into
+/// [`crate::StatementOutcome`].
+#[derive(Debug, Default, Clone)]
+pub(crate) struct OutcomeRecord {
+    /// The first place this execution observed a cancellation.
+    pub(crate) cancel_observed: Option<CancelObserved>,
+    /// The commit this execution drove was published.
+    pub(crate) publication: Option<CommitPublication>,
+    /// The commit append was submitted and then failed.
+    pub(crate) append_failed: bool,
+    /// The published commit's auto-checkpoint failed and was given up.
+    pub(crate) checkpoint_failure: Option<String>,
+    /// The connection transaction this execution's commit or rollback ended.
+    pub(crate) transaction_generation: Option<u64>,
+}
+
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
@@ -642,6 +659,8 @@ pub struct ProgramState {
     pub query_deadline: Option<crate::MonotonicInstant>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
+    /// Commit evidence for this execution.
+    pub(crate) outcome: OutcomeRecord,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
@@ -734,6 +753,7 @@ impl ProgramState {
             query_deadline: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
+            outcome: OutcomeRecord::default(),
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
@@ -861,6 +881,7 @@ impl ProgramState {
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
         self.commit_state = CommitState::Ready;
+        self.outcome = OutcomeRecord::default();
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
@@ -1569,7 +1590,11 @@ impl Program {
         }
         match pager.commit_finality() {
             CommitFinality::NotSubmitted => return Ok(false),
-            CommitFinality::Submitted if err.is_some() => return Ok(false),
+            CommitFinality::Submitted if err.is_some() => {
+                // The append itself failed: whether the WAL holds it is unknown.
+                state.outcome.append_failed = true;
+                return Ok(false);
+            }
             CommitFinality::Submitted | CommitFinality::Published => {}
         }
         let mv_store = self.connection.mv_store();
@@ -1607,11 +1632,24 @@ impl Program {
                 // own IO. After publication only the auto-checkpoint is left,
                 // and the interrupt gives that up.
                 if !self.commit_append_submitted(state, pager) {
+                    state
+                        .outcome
+                        .cancel_observed
+                        .get_or_insert(CancelObserved::BeforeIrreversibleCommit);
                     self.abort(pager, None, state)?;
                     return Ok(StepResult::Interrupt);
                 }
                 if self.commit_published(state, pager) {
+                    state
+                        .outcome
+                        .cancel_observed
+                        .get_or_insert(CancelObserved::AfterPublication);
                     pager.abandon_auto_checkpoint();
+                } else {
+                    state
+                        .outcome
+                        .cancel_observed
+                        .get_or_insert(CancelObserved::AfterSubmission);
                 }
             }
 
@@ -1630,6 +1668,10 @@ impl Program {
                     tracing::warn!(
                         "auto-checkpoint IO failed after the commit was published: {err}"
                     );
+                    state
+                        .outcome
+                        .checkpoint_failure
+                        .get_or_insert_with(|| err.to_string());
                     pager.abandon_auto_checkpoint();
                 } else if let Some(err) = io.get_error() {
                     if pager.is_checkpointing() {
@@ -2161,6 +2203,17 @@ impl Program {
         tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
         match txn_finish_result? {
             IOResult::Done(_) => {
+                program_state.outcome.transaction_generation =
+                    Some(connection.transaction_generation());
+                if !rollback {
+                    program_state.outcome.publication = pager.take_commit_publication();
+                    if let Some(failure) = pager.take_abandoned_checkpoint_failure() {
+                        program_state
+                            .outcome
+                            .checkpoint_failure
+                            .get_or_insert(failure);
+                    }
+                }
                 // Main pager commit done, now commit attached database pagers
                 match self.end_attached_write_txns(connection, rollback)? {
                     IOResult::Done(_) => {

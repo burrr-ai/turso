@@ -18,6 +18,7 @@ use crate::{
     parameters,
     schema::Trigger,
     stats::refresh_analyze_stats,
+    storage::pager::CommitFinality,
     translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
     vdbe::{
         self,
@@ -73,6 +74,76 @@ impl StatementOrigin {
     }
 }
 
+/// Identifies one execution of a statement and the connection transaction
+/// it ran in. The counters are opaque: only equality is meaningful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TxnIdentity {
+    /// The connection, unique within the process.
+    pub connection_generation: u64,
+    /// The connection transaction this execution committed, rolled back or
+    /// ran in.
+    pub transaction_generation: u64,
+    /// This execution of the statement; 0 before it starts.
+    pub root_generation: u64,
+}
+
+/// How far the commit of a statement's execution got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitPhase {
+    /// The statement has not been stepped.
+    NotStarted,
+    /// No commit driven by this execution was published.
+    NotPublished,
+    /// The commit this execution drove is published: durable and visible.
+    Published {
+        /// The WAL transaction count it reached, when the WAL tracks one.
+        transaction_count: Option<u64>,
+        max_frame: u64,
+    },
+}
+
+/// How a statement's execution ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootTerminal {
+    /// It ran to completion.
+    Done,
+    /// It ended before any commit append was submitted; its writes were
+    /// rolled back.
+    RolledBack,
+    /// Its commit append was submitted and then failed: the WAL may or may
+    /// not hold the commit.
+    Unknown,
+    /// It ended with an error after its commit was published.
+    Failed,
+}
+
+/// Where an execution first observed a cancellation (interrupt, query
+/// deadline or progress handler).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelObserved {
+    /// Before its commit append was submitted: the execution was aborted.
+    BeforeIrreversibleCommit,
+    /// After the commit append was submitted, before it was published: the
+    /// commit ran on.
+    AfterSubmission,
+    /// After the commit was published: its auto-checkpoint was given up.
+    AfterPublication,
+}
+
+/// Evidence about one execution of a statement, from
+/// [`Statement::outcome_snapshot`] or [`Statement::reset_with_outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementOutcome {
+    pub identity: TxnIdentity,
+    pub phase: CommitPhase,
+    /// None while the execution can still continue.
+    pub terminal: Option<RootTerminal>,
+    pub cancel_observed: Option<CancelObserved>,
+    /// The published commit's auto-checkpoint failed and was given up; the
+    /// commit stands.
+    pub checkpoint_failure: Option<String>,
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -103,6 +174,12 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    /// This execution's identity on the connection; 0 until it starts.
+    root_generation: u64,
+    /// The statement was stepped in this execution.
+    stepped: bool,
+    /// How this execution ended, once it did.
+    terminal: Option<RootTerminal>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -158,6 +235,9 @@ impl Statement {
             origin,
             counted_as_active_root: false,
             nested_guard_active,
+            root_generation: 0,
+            stepped: false,
+            terminal: None,
         }
     }
 
@@ -283,6 +363,10 @@ impl Statement {
     }
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        if self.root_generation == 0 {
+            self.root_generation = self.program.connection.next_root_generation();
+        }
+        self.stepped = true;
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program
                 .connection
@@ -412,7 +496,63 @@ impl Statement {
             self.release_active_root_if_counted();
         }
 
+        match &res {
+            Ok(StepResult::Done) => self.terminal = Some(RootTerminal::Done),
+            // An interrupt is returned only before the commit append is
+            // submitted; the execution was rolled back.
+            Ok(StepResult::Interrupt) => self.terminal = Some(RootTerminal::RolledBack),
+            Ok(_) => {}
+            Err(_) => self.terminal = Some(self.terminal_after_error(false)),
+        }
+
         res
+    }
+
+    /// How an execution that failed, or was torn down unfinished, ended.
+    /// `abandoned` is true for a teardown that raised no error.
+    fn terminal_after_error(&self, abandoned: bool) -> RootTerminal {
+        let outcome = &self.state.outcome;
+        if outcome.append_failed {
+            RootTerminal::Unknown
+        } else if outcome.publication.is_some()
+            || self.pager.commit_finality() == CommitFinality::Published
+        {
+            // A published commit stands; a teardown that raised no error
+            // finished it.
+            if abandoned {
+                RootTerminal::Done
+            } else {
+                RootTerminal::Failed
+            }
+        } else {
+            RootTerminal::RolledBack
+        }
+    }
+
+    /// Evidence about this execution: its identity, how far its commit got,
+    /// how it ended, and where it first observed a cancellation.
+    pub fn outcome_snapshot(&self) -> StatementOutcome {
+        let outcome = &self.state.outcome;
+        StatementOutcome {
+            identity: TxnIdentity {
+                connection_generation: self.program.connection.generation(),
+                transaction_generation: outcome
+                    .transaction_generation
+                    .unwrap_or_else(|| self.program.connection.transaction_generation()),
+                root_generation: self.root_generation,
+            },
+            phase: match outcome.publication {
+                _ if !self.stepped => CommitPhase::NotStarted,
+                Some(publication) => CommitPhase::Published {
+                    transaction_count: publication.transaction_count,
+                    max_frame: publication.max_frame,
+                },
+                None => CommitPhase::NotPublished,
+            },
+            terminal: self.terminal,
+            cancel_observed: outcome.cancel_observed,
+            checkpoint_failure: outcome.checkpoint_failure.clone(),
+        }
     }
 
     #[inline]
@@ -601,7 +741,8 @@ impl Statement {
             Some(max_registers),
             Some(cursor_count),
             self.counted_as_active_root,
-        )?;
+        )
+        .1?;
         self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
         self.program = new_program;
         // Load the parameters back into the state
@@ -830,6 +971,14 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        self.reset_internal(None, None, false).1
+    }
+
+    /// Resets the statement like [`Statement::reset`], and returns the outcome
+    /// of the execution it ended. A reset can finish that execution (a
+    /// RETURNING write whose first row was read commits here), so the outcome
+    /// is taken after the reset's own work and before the state is cleared.
+    pub fn reset_with_outcome(&mut self) -> (StatementOutcome, Result<()>) {
         self.reset_internal(None, None, false)
     }
 
@@ -858,12 +1007,14 @@ impl Statement {
         self.has_returned_row = false;
     }
 
+    /// `preserve_active_root_count` is set by a reprepare, which keeps the
+    /// execution (its identity and outcome evidence) going.
     fn reset_internal(
         &mut self,
         max_registers: Option<usize>,
         max_cursors: Option<usize>,
         preserve_active_root_count: bool,
-    ) -> Result<()> {
+    ) -> (StatementOutcome, Result<()>) {
         fn capture_reset_error(
             reset_error: &mut Option<LimboError>,
             err: LimboError,
@@ -942,7 +1093,9 @@ impl Statement {
                     }
                 }
 
-                if !halt_completed {
+                if halt_completed {
+                    self.terminal = Some(RootTerminal::Done);
+                } else {
                     if let Err(abort_err) =
                         self.program
                             .abort(&self.pager, reset_error.as_ref(), &mut self.state)
@@ -953,6 +1106,7 @@ impl Statement {
                             "Abort failed during statement reset",
                         );
                     }
+                    self.terminal = Some(self.terminal_after_error(reset_error.is_none()));
                 }
             } else {
                 // Either a read-only statement, a write statement that never
@@ -966,6 +1120,7 @@ impl Statement {
                         "Abort failed during statement reset",
                     );
                 }
+                self.terminal = Some(self.terminal_after_error(reset_error.is_none()));
             }
         } else {
             // Statement not running (Done/Failed/Init) — cleanup only.
@@ -990,7 +1145,16 @@ impl Statement {
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted();
         }
+        let outcome = self.outcome_snapshot();
+        let evidence = std::mem::take(&mut self.state.outcome);
         self.state.reset(max_registers, max_cursors);
+        if preserve_active_root_count {
+            self.state.outcome = evidence;
+        } else {
+            self.root_generation = 0;
+            self.stepped = false;
+            self.terminal = None;
+        }
         self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
@@ -998,9 +1162,9 @@ impl Statement {
         self.has_returned_row = false;
 
         if let Some(err) = reset_error {
-            return Err(err);
+            return (outcome, Err(err));
         }
-        Ok(())
+        (outcome, Ok(()))
     }
 
     pub fn row(&self) -> Option<&Row> {

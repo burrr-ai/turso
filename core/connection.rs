@@ -279,6 +279,20 @@ pub struct Connection {
     /// MUST be incremented whenever any setting that affects PrepareContext changes,
     /// and this is not currently centralized; each setter bumps the generation individually.
     pub(crate) prepare_context_generation: AtomicU64,
+    /// Process-unique identity of this connection, for statement outcomes.
+    pub(crate) generation: u64,
+    /// Bumped each time this connection begins a transaction.
+    pub(crate) transaction_generation: AtomicU64,
+    /// The last identity given to an execution of a statement here.
+    pub(crate) root_generation: AtomicU64,
+}
+
+static NEXT_CONNECTION_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A process-unique, never-zero connection identity.
+pub(crate) fn next_connection_generation() -> u64 {
+    NEXT_CONNECTION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -3075,7 +3089,27 @@ impl Connection {
     }
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {
+        if self.transaction_state.get() == TransactionState::None && state != TransactionState::None
+        {
+            self.transaction_generation.fetch_add(1, Ordering::AcqRel);
+        }
         self.transaction_state.set(state);
+    }
+
+    /// Process-unique identity of this connection (see [`crate::TxnIdentity`]).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The connection's current or last transaction: bumped each time one
+    /// begins (see [`crate::TxnIdentity`]).
+    pub fn transaction_generation(&self) -> u64 {
+        self.transaction_generation.load(Ordering::Acquire)
+    }
+
+    /// A new, never-zero identity for one execution of a statement.
+    pub(crate) fn next_root_generation(&self) -> u64 {
+        self.root_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub(crate) fn get_tx_state(&self) -> TransactionState {

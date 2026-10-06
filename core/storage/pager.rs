@@ -1049,6 +1049,15 @@ pub(crate) enum CommitFinality {
     Published,
 }
 
+/// What a published commit left in the WAL, recorded at publication for the
+/// statement that drove the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitPublication {
+    /// The WAL transaction count this commit reached, when the WAL tracks it.
+    pub(crate) transaction_count: Option<u64>,
+    pub(crate) max_frame: u64,
+}
+
 #[derive(Debug, Default)]
 struct CheckpointState {
     phase: CheckpointPhase,
@@ -1422,6 +1431,12 @@ pub struct Pager {
     #[cfg(target_vendor = "apple")]
     sync_type: AtomicFileSyncType,
     checkpoint_observer: Option<Arc<dyn CheckpointObserver>>,
+    /// Set when this pager's commit is published; taken by the statement
+    /// that drove the commit.
+    commit_publication: RwLock<Option<CommitPublication>>,
+    /// Why the published commit's auto-checkpoint failed and was given up;
+    /// taken like `commit_publication`.
+    abandoned_checkpoint_failure: RwLock<Option<String>>,
     /// Test-only commit pause points of this connection's pager.
     #[cfg(any(test, feature = "commit_test_hooks"))]
     commit_hook: RwLock<Option<commit_hooks::CommitHook>>,
@@ -1715,6 +1730,8 @@ impl Pager {
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             checkpoint_observer,
+            commit_publication: RwLock::new(None),
+            abandoned_checkpoint_failure: RwLock::new(None),
             #[cfg(any(test, feature = "commit_test_hooks"))]
             commit_hook: RwLock::new(None),
         })
@@ -1757,6 +1774,18 @@ impl Pager {
             "only a published commit's auto-checkpoint can be abandoned"
         );
         commit_info.state = CommitState::AbandonCheckpoint;
+    }
+
+    /// The publication of the commit that just ended, for the statement that
+    /// drove it; None when it was not published.
+    pub(crate) fn take_commit_publication(&self) -> Option<CommitPublication> {
+        self.commit_publication.write().take()
+    }
+
+    /// Why the commit that just ended gave its auto-checkpoint up, when the
+    /// checkpoint failed rather than being interrupted.
+    pub(crate) fn take_abandoned_checkpoint_failure(&self) -> Option<String> {
+        self.abandoned_checkpoint_failure.write().take()
     }
 
     /// Runs the BeforeIrreversibleCommit hook once per commit; true if it
@@ -2964,6 +2993,13 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
 
+        if self.commit_info.read().state == CommitState::PrepareWal {
+            // A new commit starts: evidence an earlier commit left behind
+            // belongs to no statement now.
+            self.commit_publication.write().take();
+            self.abandoned_checkpoint_failure.write().take();
+        }
+
         let complete_commit = || {
             if update_transaction_state {
                 connection.set_tx_state(TransactionState::None);
@@ -2997,6 +3033,7 @@ impl Pager {
                         Ok(IOResult::Done(_)) => complete_commit(),
                         Err(err) => {
                             tracing::debug!("auto-checkpoint failed: {err}");
+                            *self.abandoned_checkpoint_failure.write() = Some(err.to_string());
                             self.commit_info.write().state = CommitState::AbandonCheckpoint;
                             continue;
                         }
@@ -4247,6 +4284,10 @@ impl Pager {
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
+                    *self.commit_publication.write() = Some(CommitPublication {
+                        transaction_count: wal.last_commit_transaction_count(),
+                        max_frame: wal.get_max_frame(),
+                    });
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 
@@ -6577,6 +6618,17 @@ mod commit_finality_tests {
             matches!(result, Ok(StepResult::Done)),
             "commit_finality_post_publication_interrupt: the published COMMIT must finish, got {result:?}"
         );
+        let outcome = commit.outcome_snapshot();
+        assert!(
+            matches!(outcome.phase, crate::CommitPhase::Published { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::Done));
+        assert_eq!(
+            outcome.cancel_observed,
+            Some(crate::CancelObserved::AfterPublication)
+        );
+        assert_eq!(outcome.checkpoint_failure, None);
         drop(commit);
         assert!(!pager.is_checkpointing());
         assert_eq!(conn.get_tx_state(), TransactionState::None);
@@ -6608,6 +6660,20 @@ mod commit_finality_tests {
             matches!(result, Ok(StepResult::Done)),
             "commit_finality_checkpoint_failure: the published COMMIT must finish, got {result:?}"
         );
+        let outcome = commit.outcome_snapshot();
+        assert!(
+            matches!(outcome.phase, crate::CommitPhase::Published { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::Done));
+        assert_eq!(outcome.cancel_observed, None);
+        assert!(
+            outcome
+                .checkpoint_failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("injected write failure")),
+            "the checkpoint failure is reported, not dropped: {outcome:?}"
+        );
         drop(commit);
         assert!(
             !pager.is_checkpointing(),
@@ -6636,9 +6702,13 @@ mod commit_finality_tests {
         let pager = assert_published_and_checkpointing(&conn);
         assert!(held.release() > 0);
 
-        commit
-            .reset()
-            .expect("commit_finality_reset: the reset ends the published commit");
+        let (outcome, reset) = commit.reset_with_outcome();
+        reset.expect("commit_finality_reset: the reset ends the published commit");
+        assert!(
+            matches!(outcome.phase, crate::CommitPhase::Published { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::Done));
         drop(commit);
         assert!(!pager.is_checkpointing(), "the checkpoint was given up");
         assert_eq!(conn.get_tx_state(), TransactionState::None);
@@ -6670,6 +6740,16 @@ mod commit_finality_tests {
         assert!(
             matches!(result, Ok(StepResult::Done)),
             "commit_finality_submitted_interrupt: the submitted commit must finish, got {result:?}"
+        );
+        let outcome = insert.outcome_snapshot();
+        assert!(
+            matches!(outcome.phase, crate::CommitPhase::Published { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::Done));
+        assert_eq!(
+            outcome.cancel_observed,
+            Some(crate::CancelObserved::AfterSubmission)
         );
         drop(insert);
         assert_eq!(count_rows(&db.connect().expect("a reader"), &io), 1);
@@ -6712,6 +6792,15 @@ mod commit_finality_tests {
             ),
             "the interrupt is observed before the append, got {result:?}"
         );
+        let outcome = insert.outcome_snapshot();
+        assert_eq!(outcome.phase, crate::CommitPhase::NotPublished);
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::RolledBack));
+        if matches!(result, Ok(StepResult::Interrupt)) {
+            assert_eq!(
+                outcome.cancel_observed,
+                Some(crate::CancelObserved::BeforeIrreversibleCommit)
+            );
+        }
         drop(insert);
         assert_eq!(
             count_rows(&db.connect().expect("a reader"), &io),
@@ -6749,6 +6838,130 @@ mod commit_finality_tests {
         assert!(
             matches!(insert.step(), Ok(StepResult::Done)),
             "a hook that never yields: still one step"
+        );
+    }
+
+    /// Each execution has its own identity; a reset reports the execution it
+    /// ended unchanged, and the next execution is a new transaction.
+    #[test]
+    fn outcome_identity_tells_executions_and_connections_apart() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), "commit-outcome-identity.db")
+            .expect("the database opens");
+        let conn = db.connect().expect("a connection");
+        conn.execute("CREATE TABLE t(v)")
+            .expect("the table is created");
+        let mut insert = conn
+            .prepare("INSERT INTO t VALUES (1)")
+            .expect("the insert prepares");
+        let unstarted = insert.outcome_snapshot();
+        assert_eq!(unstarted.phase, crate::CommitPhase::NotStarted);
+        assert_eq!(unstarted.terminal, None);
+        assert_eq!(unstarted.identity.root_generation, 0);
+
+        assert!(matches!(finish(&mut insert, &io), Ok(StepResult::Done)));
+        let first = insert.outcome_snapshot();
+        assert!(
+            matches!(
+                first.phase,
+                crate::CommitPhase::Published {
+                    transaction_count: Some(_),
+                    max_frame,
+                } if max_frame > 0
+            ),
+            "{first:?}"
+        );
+        assert_eq!(first.terminal, Some(crate::RootTerminal::Done));
+        assert_eq!(first.cancel_observed, None);
+        assert_eq!(first.identity.connection_generation, conn.generation());
+        assert_ne!(first.identity.root_generation, 0);
+
+        let (reset_outcome, reset) = insert.reset_with_outcome();
+        reset.expect("the reset succeeds");
+        assert_eq!(
+            reset_outcome, first,
+            "a finished execution is reported as it ended"
+        );
+        assert_eq!(
+            insert.outcome_snapshot().phase,
+            crate::CommitPhase::NotStarted
+        );
+
+        assert!(matches!(finish(&mut insert, &io), Ok(StepResult::Done)));
+        let second = insert.outcome_snapshot();
+        assert_ne!(
+            second.identity.root_generation,
+            first.identity.root_generation
+        );
+        assert!(
+            second.identity.transaction_generation > first.identity.transaction_generation,
+            "{first:?} {second:?}"
+        );
+        assert_ne!(
+            db.connect().expect("another connection").generation(),
+            conn.generation()
+        );
+    }
+
+    /// A RETURNING write whose first row was read is committed by its reset;
+    /// the reset reports that commit.
+    #[test]
+    fn reset_with_outcome_reports_a_returning_write_the_reset_commits() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), "commit-outcome-returning.db")
+            .expect("the database opens");
+        let conn = db.connect().expect("a connection");
+        conn.execute("CREATE TABLE t(v)")
+            .expect("the table is created");
+        let mut insert = conn
+            .prepare("INSERT INTO t VALUES (1), (2) RETURNING v")
+            .expect("the insert prepares");
+        loop {
+            match insert.step().expect("the insert steps") {
+                StepResult::Row => break,
+                StepResult::IO => io.step().expect("the IO steps"),
+                other => panic!("the insert returned {other:?} before its first row"),
+            }
+        }
+        let (outcome, reset) = insert.reset_with_outcome();
+        reset.expect("the reset commits the write");
+        assert!(
+            matches!(outcome.phase, crate::CommitPhase::Published { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::Done));
+        drop(insert);
+        assert_eq!(count_rows(&conn, &io), 2);
+    }
+
+    /// A commit append that was submitted and then failed may or may not be in
+    /// the WAL: the outcome is Unknown, not RolledBack.
+    #[test]
+    fn failed_commit_append_is_unknown() {
+        let (_db, conn, io, held) = open_with_held_writes(WAL_PATH);
+        let mut insert = conn
+            .prepare("INSERT INTO t(v) VALUES (1)")
+            .expect("the insert prepares");
+        step_until_held(&mut insert, &io, &held);
+        assert_eq!(
+            conn.pager.load().commit_finality(),
+            CommitFinality::Submitted
+        );
+        let failure =
+            CompletionError::IOError(std::io::ErrorKind::Other, "injected append failure");
+        assert!(held.release_with(Some(failure)) > 0);
+
+        let result = finish(&mut insert, &io);
+        assert!(
+            result.is_err(),
+            "the failed append fails the insert, got {result:?}"
+        );
+        let outcome = insert.outcome_snapshot();
+        assert_eq!(outcome.phase, crate::CommitPhase::NotPublished);
+        assert_eq!(
+            outcome.terminal,
+            Some(crate::RootTerminal::Unknown),
+            "commit_outcome_append_failure: {outcome:?}"
         );
     }
 }
