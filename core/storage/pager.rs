@@ -6316,6 +6316,11 @@ mod commit_finality_tests {
         path: &'static str,
         armed: AtomicBool,
         writes: Mutex<Vec<(Completion, HeldResult)>>,
+        /// Every write held since the file was opened, released or not.
+        ever_held: AtomicUsize,
+        /// The next armed vectored write stores its bytes, then fails both its
+        /// completion and the submitting call.
+        fail_next_submit: AtomicBool,
     }
 
     impl HeldWrites {
@@ -6324,12 +6329,15 @@ mod commit_finality_tests {
                 path,
                 armed: AtomicBool::new(false),
                 writes: Mutex::new(Vec::new()),
+                ever_held: AtomicUsize::new(0),
+                fail_next_submit: AtomicBool::new(false),
             }
         }
 
         /// The completion to give the real write in place of `c`.
         fn hold(&self, c: &Completion) -> Completion {
             let result: HeldResult = Arc::new(std::sync::OnceLock::new());
+            self.ever_held.fetch_add(1, Ordering::SeqCst);
             self.writes.lock().push((c.clone(), result.clone()));
             Completion::new_write(move |res| {
                 let _ = result.set(res);
@@ -6363,6 +6371,8 @@ mod commit_finality_tests {
     struct HoldWritesIo {
         inner: Arc<MemoryIO>,
         held: Arc<HeldWrites>,
+        /// A second held file whose held writes the IO step fails.
+        failing: Option<Arc<HeldWrites>>,
     }
 
     impl Clock for HoldWritesIo {
@@ -6380,7 +6390,14 @@ mod commit_finality_tests {
             let inner = self.inner.open_file(path, flags, direct)?;
             Ok(Arc::new(HoldWritesFile {
                 inner,
-                held: (path == self.held.path).then(|| self.held.clone()),
+                held: (path == self.held.path)
+                    .then(|| self.held.clone())
+                    .or_else(|| {
+                        self.failing
+                            .as_ref()
+                            .filter(|failing| path == failing.path)
+                            .cloned()
+                    }),
             }))
         }
 
@@ -6389,6 +6406,12 @@ mod commit_finality_tests {
         }
 
         fn step(&self) -> Result<()> {
+            if let Some(failing) = self.failing.as_ref().filter(|failing| failing.held() > 0) {
+                failing.release_with(Some(CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "injected write failure while stepping IO",
+                )));
+            }
             self.inner.step()
         }
 
@@ -6442,6 +6465,17 @@ mod commit_finality_tests {
             let Some(held) = self.armed() else {
                 return self.inner.pwritev(pos, buffers, c);
             };
+            if held.fail_next_submit.swap(false, Ordering::SeqCst) {
+                // The bytes may be stored, yet the submission reports failure:
+                // whether the append happened is unknown to the caller.
+                let _stored = self
+                    .inner
+                    .pwritev(pos, buffers, Completion::new_write(|_| {}))?;
+                let failure =
+                    CompletionError::IOError(std::io::ErrorKind::Other, "injected submit failure");
+                c.error(failure);
+                return Err(LimboError::CompletionError(failure));
+            }
             let _stand_in = self.inner.pwritev(pos, buffers, held.hold(&c))?;
             Ok(c)
         }
@@ -6467,6 +6501,7 @@ mod commit_finality_tests {
         let io: Arc<dyn IO> = Arc::new(HoldWritesIo {
             inner: Arc::new(MemoryIO::new()),
             held: held.clone(),
+            failing: None,
         });
         let db = Database::open_file(io.clone(), DB_PATH).expect("the database opens");
         let conn = db.connect().expect("a connection");
@@ -7002,5 +7037,224 @@ mod commit_finality_tests {
             Some(crate::RootTerminal::Unknown),
             "commit_outcome_append_failure: {outcome:?}"
         );
+    }
+
+    /// A COMMIT torn down after its append was submitted ends as committed
+    /// without starting the auto-checkpoint it would have run: no checkpoint
+    /// write reaches the database, and nothing is left checkpointing.
+    #[test]
+    fn teardown_of_a_submitted_commit_starts_no_new_checkpoint() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let wal = Arc::new(HeldWrites::new(WAL_PATH));
+        let db_writes = Arc::new(HeldWrites::new(DB_PATH));
+        let io: Arc<dyn IO> = Arc::new(HoldWritesIo {
+            inner: Arc::new(MemoryIO::new()),
+            held: wal.clone(),
+            failing: Some(db_writes.clone()),
+        });
+        let db = Database::open_file(io.clone(), DB_PATH).expect("the database opens");
+        let conn = db.connect().expect("a connection");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+            .expect("the table is created");
+        begin_large_transaction(&conn);
+        let mut commit = conn.prepare("COMMIT").expect("the commit prepares");
+        step_until_held(&mut commit, &io, &wal);
+        assert_eq!(
+            conn.pager.load().commit_finality(),
+            CommitFinality::Submitted
+        );
+        assert!(wal.release() > 0);
+        db_writes.armed.store(true, Ordering::SeqCst);
+
+        let (outcome, reset) = commit.reset_with_outcome();
+        let pager = conn.pager.load_full();
+        let checkpoint_writes = db_writes.ever_held.load(Ordering::SeqCst);
+        let checkpointing = pager.is_checkpointing();
+        let tx_state = conn.get_tx_state();
+        if checkpointing || tx_state != TransactionState::None {
+            // Read the leaked state first, then clean it up so that unwinding
+            // from the assertion below does not roll the published commit back.
+            pager.cleanup_after_auto_checkpoint_failure();
+            conn.set_tx_state(TransactionState::None);
+        }
+        assert_eq!(
+            (checkpoint_writes, checkpointing, tx_state),
+            (0, false, TransactionState::None),
+            "teardown_no_new_checkpoint: outcome={outcome:?} reset={reset:?}"
+        );
+        reset.expect("the teardown ends the commit");
+        assert!(
+            matches!(outcome.phase, crate::CommitPhase::Published { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::Done));
+        assert_eq!(outcome.checkpoint_failure, None);
+        drop(commit);
+        let reader = db.connect().expect("a reader");
+        assert_eq!(count_rows(&reader, &io), ROWS, "the published rows stay");
+        conn.execute("INSERT INTO t(v) VALUES (1)")
+            .expect("the connection writes again");
+    }
+
+    /// A published COMMIT whose pending auto-checkpoint write failed, then
+    /// reset: the checkpoint is given up and reported, the commit stands and
+    /// nothing is left checkpointing (D8 on the teardown path).
+    #[test]
+    fn reset_records_a_failed_pending_checkpoint_and_keeps_the_commit() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let (db, conn, io, held) = open_with_held_writes(DB_PATH);
+        begin_large_transaction(&conn);
+        let mut commit = conn.prepare("COMMIT").expect("the commit prepares");
+        step_until_held(&mut commit, &io, &held);
+        let pager = assert_published_and_checkpointing(&conn);
+        let failure =
+            CompletionError::IOError(std::io::ErrorKind::Other, "injected checkpoint failure");
+        assert!(held.release_with(Some(failure)) > 0);
+
+        let (outcome, reset) = commit.reset_with_outcome();
+        assert!(
+            reset.is_ok()
+                && outcome.terminal == Some(crate::RootTerminal::Done)
+                && outcome
+                    .checkpoint_failure
+                    .as_deref()
+                    .is_some_and(|failure| failure.contains("injected checkpoint failure")),
+            "reset_checkpoint_failure: outcome={outcome:?} reset={reset:?}"
+        );
+        assert!(
+            matches!(outcome.phase, crate::CommitPhase::Published { .. }),
+            "{outcome:?}"
+        );
+        drop(commit);
+        assert!(!pager.is_checkpointing());
+        assert_eq!(conn.get_tx_state(), TransactionState::None);
+        let reader = db.connect().expect("a reader");
+        assert_eq!(count_rows(&reader, &io), ROWS, "the published rows stay");
+        conn.execute("INSERT INTO t(v) VALUES (1)")
+            .expect("the connection writes again");
+    }
+
+    /// A submitted append that failed, observed by a reset rather than by a
+    /// step, is still unknown: the WAL may hold it.
+    #[test]
+    fn failed_append_seen_by_reset_is_unknown() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let (_db, conn, io, held) = open_with_held_writes(WAL_PATH);
+        let mut insert = conn
+            .prepare("INSERT INTO t(v) VALUES (1)")
+            .expect("the insert prepares");
+        step_until_held(&mut insert, &io, &held);
+        assert_eq!(
+            conn.pager.load().commit_finality(),
+            CommitFinality::Submitted
+        );
+        let failure =
+            CompletionError::IOError(std::io::ErrorKind::Other, "injected append failure");
+        assert!(held.release_with(Some(failure)) > 0);
+
+        let (outcome, reset) = insert.reset_with_outcome();
+        assert_eq!(
+            outcome.terminal,
+            Some(crate::RootTerminal::Unknown),
+            "reset_append_failure: outcome={outcome:?} reset={reset:?}"
+        );
+        assert_eq!(outcome.phase, crate::CommitPhase::NotPublished);
+    }
+
+    /// A submission that reports failure synchronously may have stored the
+    /// append: the outcome is Unknown, even though the pager never reached
+    /// its submitted state.
+    #[test]
+    fn synchronous_append_submit_error_is_unknown() {
+        let (_db, conn, io, held) = open_with_held_writes(WAL_PATH);
+        let mut insert = conn
+            .prepare("INSERT INTO t(v) VALUES (1)")
+            .expect("the insert prepares");
+        held.armed.store(true, Ordering::SeqCst);
+        held.fail_next_submit.store(true, Ordering::SeqCst);
+
+        let result = finish(&mut insert, &io);
+        assert!(result.is_err(), "the failed submission fails the insert");
+        assert!(
+            !held.fail_next_submit.load(Ordering::SeqCst),
+            "the injected submit failure fired"
+        );
+        let outcome = insert.outcome_snapshot();
+        assert_eq!(
+            outcome.terminal,
+            Some(crate::RootTerminal::Unknown),
+            "sync_submit_failure: outcome={outcome:?} result={result:?}"
+        );
+        assert_eq!(outcome.phase, crate::CommitPhase::NotPublished);
+    }
+
+    /// While a published COMMIT still runs its auto-checkpoint IO, the
+    /// snapshot already reports the publication; the execution has not ended.
+    #[test]
+    fn snapshot_reports_the_publication_while_the_checkpoint_runs() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let (_db, conn, io, held) = open_with_held_writes(DB_PATH);
+        begin_large_transaction(&conn);
+        let mut commit = conn.prepare("COMMIT").expect("the commit prepares");
+        step_until_held(&mut commit, &io, &held);
+        assert_published_and_checkpointing(&conn);
+        let during = commit.outcome_snapshot();
+        assert!(held.release() > 0);
+        let result = finish(&mut commit, &io);
+        assert!(matches!(result, Ok(StepResult::Done)), "got {result:?}");
+        let after = commit.outcome_snapshot();
+        assert!(
+            matches!(during.phase, crate::CommitPhase::Published { .. })
+                && during.terminal.is_none(),
+            "snapshot_during_checkpoint: {during:?}"
+        );
+        assert_eq!(during.phase, after.phase);
+        assert_eq!(after.terminal, Some(crate::RootTerminal::Done));
+    }
+
+    /// An execution rolled back by an interrupt keeps the transaction it ran
+    /// in, even after the connection runs another transaction.
+    #[test]
+    fn rolled_back_root_keeps_its_transaction_identity() {
+        let (_db, conn, io, _held) = open_with_held_writes(WAL_PATH);
+        let guard = conn.install_commit_test_hook(Arc::new(|point: CommitHookPoint| {
+            if point == CommitHookPoint::BeforeIrreversibleCommit {
+                HookAction::Yield
+            } else {
+                HookAction::Continue
+            }
+        }));
+        let mut insert = conn
+            .prepare("INSERT INTO t(v) VALUES (1)")
+            .expect("the insert prepares");
+        assert!(matches!(insert.step(), Ok(StepResult::IO)));
+        conn.interrupt();
+        assert!(matches!(
+            finish(&mut insert, &io),
+            Ok(StepResult::Interrupt)
+        ));
+        let before = insert.outcome_snapshot();
+        assert_eq!(before.terminal, Some(crate::RootTerminal::RolledBack));
+        drop(guard);
+        conn.execute("INSERT INTO t(v) VALUES (2)")
+            .expect("another transaction commits");
+        let after = insert.outcome_snapshot();
+        assert_eq!(
+            before.identity, after.identity,
+            "rolled_back_identity: before={before:?} after={after:?}"
+        );
+        assert_ne!(before.identity.transaction_generation, 0);
     }
 }
