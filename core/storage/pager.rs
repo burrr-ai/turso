@@ -6358,6 +6358,9 @@ mod commit_finality_tests {
         /// The next armed vectored write stores its bytes, then fails both its
         /// completion and the submitting call.
         fail_next_submit: AtomicBool,
+        /// The next sync of this file fails at once: its completion and the
+        /// call.
+        fail_next_sync: AtomicBool,
     }
 
     impl HeldWrites {
@@ -6368,6 +6371,7 @@ mod commit_finality_tests {
                 writes: Mutex::new(Vec::new()),
                 ever_held: AtomicUsize::new(0),
                 fail_next_submit: AtomicBool::new(false),
+                fail_next_sync: AtomicBool::new(false),
             }
         }
 
@@ -6518,6 +6522,16 @@ mod commit_finality_tests {
         }
 
         fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            if self
+                .held
+                .as_ref()
+                .is_some_and(|held| held.fail_next_sync.swap(false, Ordering::SeqCst))
+            {
+                let failure =
+                    CompletionError::IOError(std::io::ErrorKind::Other, "injected sync failure");
+                c.error(failure);
+                return Err(LimboError::CompletionError(failure));
+            }
             self.inner.sync(c, sync_type)
         }
 
@@ -7205,6 +7219,10 @@ mod commit_finality_tests {
             "reset_append_failure: outcome={outcome:?} reset={reset:?}"
         );
         assert_eq!(outcome.phase, crate::CommitPhase::NotPublished);
+        assert!(
+            reset.is_err(),
+            "reset_append_failure_error: reset={reset:?}"
+        );
     }
 
     /// A submission that reports failure synchronously may have stored the
@@ -7293,5 +7311,163 @@ mod commit_finality_tests {
             "rolled_back_identity: before={before:?} after={after:?}"
         );
         assert_ne!(before.identity.transaction_generation, 0);
+    }
+
+    /// The WAL sync a teardown drives itself can fail too: the outcome is
+    /// Unknown and the reset reports that error.
+    #[test]
+    fn teardown_reports_a_late_wal_sync_error() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let (_db, conn, io, held) = open_with_held_writes(WAL_PATH);
+        conn.execute("PRAGMA synchronous=FULL")
+            .expect("synchronous FULL is set");
+        let mut insert = conn
+            .prepare("INSERT INTO t(v) VALUES (1)")
+            .expect("the insert prepares");
+        step_until_held(&mut insert, &io, &held);
+        assert_eq!(
+            conn.pager.load().commit_finality(),
+            CommitFinality::Submitted
+        );
+        assert!(held.release() > 0);
+        held.fail_next_sync.store(true, Ordering::SeqCst);
+
+        let (outcome, reset) = insert.reset_with_outcome();
+        assert!(
+            !held.fail_next_sync.load(Ordering::SeqCst),
+            "the teardown drove the WAL sync"
+        );
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::Unknown));
+        assert!(
+            reset.is_err(),
+            "late_sync_error: outcome={outcome:?} reset={reset:?}"
+        );
+    }
+
+    /// An attached database's failed append is not the main commit's
+    /// checkpoint failure, though the main commit is published.
+    #[test]
+    fn attached_append_failure_is_not_a_checkpoint_failure() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let held = Arc::new(HeldWrites::new("aux.db-wal"));
+        let io: Arc<dyn IO> = Arc::new(HoldWritesIo {
+            inner: Arc::new(MemoryIO::new()),
+            held: held.clone(),
+            failing: None,
+        });
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            DB_PATH,
+            OpenFlags::Create,
+            crate::DatabaseOpts::new().with_attach(true),
+            None,
+        )
+        .expect("the database opens");
+        let conn = db.connect().expect("a connection opens");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+            .expect("the main table is created");
+        conn.execute("ATTACH DATABASE 'aux.db' AS aux")
+            .expect("aux attaches");
+        conn.execute("CREATE TABLE aux.t(v)")
+            .expect("the aux table is created");
+        conn.execute("BEGIN").expect("the transaction begins");
+        conn.execute("INSERT INTO t(v) VALUES (1)")
+            .expect("main is written");
+        conn.execute("INSERT INTO aux.t(v) VALUES (2)")
+            .expect("aux is written");
+        let mut commit = conn.prepare("COMMIT").expect("COMMIT prepares");
+        step_until_held(&mut commit, &io, &held);
+        assert!(matches!(
+            commit.outcome_snapshot().phase,
+            crate::CommitPhase::Published { .. }
+        ));
+        let failure =
+            CompletionError::IOError(std::io::ErrorKind::Other, "injected aux append failure");
+        assert!(held.release_with(Some(failure)) > 0);
+
+        let (outcome, reset) = commit.reset_with_outcome();
+        assert!(
+            reset.is_err() && outcome.checkpoint_failure.is_none(),
+            "attached_append_failure: outcome={outcome:?} reset={reset:?}"
+        );
+    }
+
+    /// A RETURNING write whose row was read commits on reset; torn down
+    /// with its append submitted, it starts no auto-checkpoint either.
+    #[test]
+    fn returning_reset_of_a_submitted_commit_starts_no_checkpoint() {
+        if std::env::var_os(CHILD).is_none() {
+            run_current_test_in_child(CHILD, std::time::Duration::from_secs(60));
+            return;
+        }
+        let wal = Arc::new(HeldWrites::new(WAL_PATH));
+        let db_writes = Arc::new(HeldWrites::new(DB_PATH));
+        let io: Arc<dyn IO> = Arc::new(HoldWritesIo {
+            inner: Arc::new(MemoryIO::new()),
+            held: wal.clone(),
+            failing: Some(db_writes.clone()),
+        });
+        let db = Database::open_file(io.clone(), DB_PATH).expect("the database opens");
+        let conn = db.connect().expect("a connection opens");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+            .expect("the table is created");
+        let values = vec!["(randomblob(3000))"; ROWS as usize].join(",");
+        let mut insert = conn
+            .prepare(format!("INSERT INTO t(v) VALUES {values} RETURNING id"))
+            .expect("the insert prepares");
+        loop {
+            match insert.step().expect("the insert steps") {
+                StepResult::Row => break,
+                StepResult::IO => io.step().expect("IO steps"),
+                other => panic!("expected a RETURNING row, got {other:?}"),
+            }
+        }
+        wal.armed.store(true, Ordering::SeqCst);
+        loop {
+            match insert.step().expect("the insert steps") {
+                StepResult::Row => {}
+                StepResult::IO if wal.held() > 0 => break,
+                StepResult::IO => io.step().expect("IO steps"),
+                other => panic!("expected submitted WAL IO, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            conn.pager.load().commit_finality(),
+            CommitFinality::Submitted
+        );
+        assert!(wal.release() > 0);
+        db_writes.armed.store(true, Ordering::SeqCst);
+
+        let (outcome, reset) = insert.reset_with_outcome();
+        let pager = conn.pager.load_full();
+        let checkpoint_writes = db_writes.ever_held.load(Ordering::SeqCst);
+        let checkpointing = pager.is_checkpointing();
+        let tx_state = conn.get_tx_state();
+        if checkpointing || tx_state != TransactionState::None {
+            // Read the leaked state first, then clean it up so that unwinding
+            // from the assertion below does not roll the published commit back.
+            pager.cleanup_after_auto_checkpoint_failure();
+            conn.set_tx_state(TransactionState::None);
+        }
+        assert_eq!(
+            (checkpoint_writes, checkpointing, tx_state),
+            (0, false, TransactionState::None),
+            "returning_teardown_no_new_checkpoint: outcome={outcome:?} reset={reset:?}"
+        );
+        reset.expect("the teardown ends the commit");
+        assert!(
+            matches!(outcome.phase, crate::CommitPhase::Published { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.terminal, Some(crate::RootTerminal::Done));
+        drop(insert);
+        let reader = db.connect().expect("a reader");
+        assert_eq!(count_rows(&reader, &io), ROWS, "the published rows stay");
     }
 }
