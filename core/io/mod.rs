@@ -162,6 +162,7 @@ pub trait File: Send + Sync {
         let mut pos = pos;
         let outstanding = Arc::new(AtomicUsize::new(buffers.len()));
         let total_written = Arc::new(AtomicUsize::new(0));
+        let first_error = Arc::new(crate::sync::OnceLock::new());
 
         for buf in buffers {
             let len = buf.len();
@@ -169,13 +170,24 @@ pub trait File: Send + Sync {
                 let c_main = c.clone();
                 let outstanding = outstanding.clone();
                 let total_written = total_written.clone();
-                Completion::new_write(move |n| {
-                    if let Ok(n) = n {
+                let first_error = first_error.clone();
+                Completion::new_write(move |res| {
+                    match res {
                         // accumulate bytes actually reported by the backend
-                        total_written.fetch_add(n as usize, Ordering::SeqCst);
-                        if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
-                            // last one finished
-                            c_main.complete(total_written.load(Ordering::Acquire) as i32);
+                        Ok(n) => {
+                            total_written.fetch_add(n as usize, Ordering::SeqCst);
+                        }
+                        Err(err) => {
+                            let _ = first_error.set(err);
+                        }
+                    }
+                    // Failed and aborted sub-writes count too: the vectored write
+                    // finishes once all of them finished, never while one is still
+                    // in flight over its buffer, and with the first error if any.
+                    if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        match first_error.get() {
+                            Some(err) => c_main.error(*err),
+                            None => c_main.complete(total_written.load(Ordering::Acquire) as i32),
                         }
                     }
                 })
@@ -653,6 +665,112 @@ mod buffer_tests {
         })
         .join()
         .expect("buffer drop must not panic during thread-local teardown");
+    }
+}
+
+#[cfg(test)]
+mod default_pwritev_tests {
+    use super::*;
+    use crate::CompletionError;
+
+    /// Holds every submitted sub-write until the test finishes it, and keeps
+    /// the default `File::pwritev`, like backends without their own vectored
+    /// write (the experimental IOCP backend, for one).
+    #[derive(Default)]
+    struct HeldWrites(crate::sync::Mutex<Vec<Completion>>);
+
+    impl HeldWrites {
+        fn take(&self) -> Vec<Completion> {
+            std::mem::take(&mut *self.0.lock())
+        }
+    }
+
+    impl File for HeldWrites {
+        fn lock_file(&self, _exclusive: bool) -> Result<()> {
+            Ok(())
+        }
+        fn unlock_file(&self) -> Result<()> {
+            Ok(())
+        }
+        fn pread(&self, _pos: u64, _c: Completion) -> Result<Completion> {
+            unreachable!("this file only writes")
+        }
+        fn pwrite(&self, _pos: u64, _buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.0.lock().push(c.clone());
+            Ok(c)
+        }
+        fn sync(&self, _c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
+            unreachable!("this file only writes")
+        }
+        fn size(&self) -> Result<u64> {
+            Ok(0)
+        }
+        fn truncate(&self, _len: u64, _c: Completion) -> Result<Completion> {
+            unreachable!("this file only writes")
+        }
+    }
+
+    fn page() -> Arc<Buffer> {
+        Arc::new(Buffer::new_temporary(4096))
+    }
+
+    /// A default vectored write finishes only once every sub-write finished,
+    /// failed or aborted ones included, and then with the first error.
+    #[test]
+    fn default_pwritev_finishes_after_every_sub_write_with_the_first_error() {
+        let file = HeldWrites::default();
+        let vectored = file
+            .pwritev(
+                0,
+                vec![page(), page(), page()],
+                Completion::new_write(|_| {}),
+            )
+            .expect("the sub-writes are submitted");
+        let subs = file.take();
+        assert_eq!(subs.len(), 3);
+        subs[0].error(CompletionError::ShortWrite);
+        subs[1].abort();
+        assert!(
+            !vectored.finished(),
+            "default_pwritev_early_finish: a sub-write is still in flight"
+        );
+        subs[2].complete(4096);
+        assert!(
+            vectored.finished(),
+            "default_pwritev_lost_error: every sub-write finished but the vectored write is pending"
+        );
+        assert_eq!(vectored.get_error(), Some(CompletionError::ShortWrite));
+    }
+
+    /// The same through `WriteBatch` and a `CompletionGroup`, as a checkpoint
+    /// submits page runs: a run that failed before `build` and a vectored run
+    /// with a failed sub-write still finish the group once all IO finished.
+    #[test]
+    fn default_pwritev_runs_in_a_group_finish_it_with_the_first_error() {
+        let file = Arc::new(HeldWrites::default());
+        let single = [page()];
+        let run = [page(), page()];
+        let mut batch = WriteBatch::new(file.clone());
+        batch.writev(0, &single);
+        batch.writev(8192, &run);
+        let runs = batch.submit().expect("the runs are submitted");
+        assert_eq!(runs.len(), 2);
+        let subs = file.take();
+        assert_eq!(subs.len(), 3);
+        subs[0].error(CompletionError::ShortWrite);
+        let mut group = CompletionGroup::new(|_| {});
+        for run in &runs {
+            group.add(run);
+        }
+        let group = group.build();
+        subs[1].error(CompletionError::ShortWrite);
+        assert!(!group.finished(), "a sub-write is still in flight");
+        subs[2].complete(4096);
+        assert!(
+            group.finished(),
+            "default_pwritev_group_pending: every sub-write finished but the group is pending"
+        );
+        assert_eq!(group.get_error(), Some(CompletionError::ShortWrite));
     }
 }
 
