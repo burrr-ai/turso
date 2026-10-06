@@ -509,6 +509,8 @@ impl Statement {
             self.release_active_root_if_counted();
         }
 
+        let ended = matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err();
+        self.fix_transaction_generation(ended);
         match &res {
             Ok(StepResult::Done) => self.terminal = Some(RootTerminal::Done),
             // An interrupt is returned only before the commit append is
@@ -519,6 +521,17 @@ impl Statement {
         }
 
         res
+    }
+
+    /// Fixes the transaction this execution ran in once it is known: while
+    /// the execution runs inside one, or when it ends.
+    fn fix_transaction_generation(&mut self, ended: bool) {
+        let connection = &self.program.connection;
+        if self.state.outcome.transaction_generation.is_none()
+            && (ended || connection.get_tx_state() != TransactionState::None)
+        {
+            self.state.outcome.transaction_generation = Some(connection.transaction_generation());
+        }
     }
 
     /// How an execution that failed, or was torn down unfinished, ended.
@@ -549,9 +562,9 @@ impl Statement {
         StatementOutcome {
             identity: TxnIdentity {
                 connection_generation: self.program.connection.generation(),
-                transaction_generation: outcome
-                    .transaction_generation
-                    .unwrap_or_else(|| self.program.connection.transaction_generation()),
+                // 0 until the execution's transaction is known; never the
+                // connection's current one, which a later transaction moves.
+                transaction_generation: outcome.transaction_generation.unwrap_or(0),
                 root_generation: self.root_generation,
             },
             phase: match outcome.publication {
@@ -1040,14 +1053,32 @@ impl Statement {
         }
 
         let mut reset_error: Option<LimboError> = None;
+        // A failed submitted append the reset itself observed; the teardown
+        // must not drive that commit on as if it succeeded.
+        let mut append_error: Option<LimboError> = None;
 
         if let Some(io) = self.state.io_completions.take() {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {
-                capture_reset_error(
-                    &mut reset_error,
-                    err,
-                    "Error while draining pending IO during statement reset",
-                );
+                match self
+                    .program
+                    .classify_commit_io_failure(&self.pager, &mut self.state, &err)
+                {
+                    // Recorded; the published commit stands (D8).
+                    vdbe::CommitIoFailure::CheckpointGivenUp => {}
+                    vdbe::CommitIoFailure::AppendFailed => {
+                        append_error = Some(err.clone());
+                        capture_reset_error(
+                            &mut reset_error,
+                            err,
+                            "The commit append failed while draining IO during statement reset",
+                        );
+                    }
+                    vdbe::CommitIoFailure::NotCommitting => capture_reset_error(
+                        &mut reset_error,
+                        err,
+                        "Error while draining pending IO during statement reset",
+                    ),
+                }
             }
         }
 
@@ -1126,7 +1157,10 @@ impl Statement {
                 // yielded a Row (DML still in progress or hit Busy/error), or a
                 // write statement without RETURNING. Rollback to avoid committing
                 // partial DML or silently retrying after transient errors (Busy).
-                if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
+                if let Err(abort_err) =
+                    self.program
+                        .abort(&self.pager, append_error.as_ref(), &mut self.state)
+                {
                     capture_reset_error(
                         &mut reset_error,
                         abort_err,
@@ -1157,6 +1191,9 @@ impl Statement {
         }
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted();
+        }
+        if self.stepped {
+            self.fix_transaction_generation(true);
         }
         let outcome = self.outcome_snapshot();
         let evidence = std::mem::take(&mut self.state.outcome);

@@ -65,7 +65,7 @@ use smallvec::SmallVec;
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{
-    storage::pager::{CommitFinality, CommitPublication, Pager},
+    storage::pager::{CommitEvidence, CommitFinality, CommitPublication, Pager},
     translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, ImmutableRecord, Value},
     vdbe::{builder::CursorType, insn::Insn},
@@ -635,8 +635,40 @@ pub(crate) struct OutcomeRecord {
     pub(crate) append_failed: bool,
     /// The published commit's auto-checkpoint failed and was given up.
     pub(crate) checkpoint_failure: Option<String>,
-    /// The connection transaction this execution's commit or rollback ended.
+    /// The connection transaction this execution ran in, fixed once known.
     pub(crate) transaction_generation: Option<u64>,
+    /// Submitting this execution's commit append was attempted.
+    pub(crate) submit_attempted: bool,
+}
+
+impl OutcomeRecord {
+    /// Folds in the evidence of a `commit_tx` call this execution just made.
+    fn absorb_commit_evidence(&mut self, evidence: CommitEvidence, call_failed: bool) {
+        self.submit_attempted |= evidence.submit_attempted;
+        if evidence.publication.is_some() {
+            self.publication = evidence.publication;
+        }
+        if let Some(failure) = evidence.checkpoint_failure {
+            self.checkpoint_failure.get_or_insert(failure);
+        }
+        // A submission that failed, even synchronously, may have stored the
+        // append: unknown, never rolled back (H D3).
+        if call_failed && self.submit_attempted && self.publication.is_none() {
+            self.append_failed = true;
+        }
+    }
+}
+
+/// What a failed IO of an execution means for the commit it drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitIoFailure {
+    /// The commit is published: its auto-checkpoint is given up, the failure
+    /// is recorded, and the commit ends as committed (D8).
+    CheckpointGivenUp,
+    /// The submitted append failed: whether the WAL holds it is unknown.
+    AppendFailed,
+    /// The execution drives no commit past its append.
+    NotCommitting,
 }
 
 pub struct ProgramState {
@@ -1597,15 +1629,60 @@ impl Program {
             }
             CommitFinality::Submitted | CommitFinality::Published => {}
         }
+        // A teardown finishes the commit; it never starts its auto-checkpoint.
+        pager.skip_auto_checkpoint_after_publication();
         let mv_store = self.connection.mv_store();
         loop {
             if pager.commit_finality() == CommitFinality::Published {
                 pager.abandon_auto_checkpoint();
             }
-            match self.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
-                IOResult::Done(_) => return Ok(true),
-                IOResult::IO(io) => io.wait(pager.io.as_ref())?,
+            match self.commit_txn(pager.clone(), state, mv_store.as_ref(), false) {
+                Ok(IOResult::Done(_)) => return Ok(true),
+                Ok(IOResult::IO(io)) => {
+                    if let Err(err) = io.wait(pager.io.as_ref()) {
+                        match self.classify_commit_io_failure(pager, state, &err) {
+                            CommitIoFailure::CheckpointGivenUp => {}
+                            CommitIoFailure::AppendFailed => return Ok(false),
+                            CommitIoFailure::NotCommitting => return Err(err),
+                        }
+                    }
+                }
+                // A failed submitted append was recorded with its evidence.
+                Err(_) if state.outcome.append_failed => return Ok(false),
+                Err(err) => return Err(err),
             }
+        }
+    }
+
+    /// Classifies a failed IO of this execution against the commit it drives
+    /// and records what it means. The step, the teardown and the reset all
+    /// classify through here.
+    pub(crate) fn classify_commit_io_failure(
+        &self,
+        pager: &Pager,
+        state: &mut ProgramState,
+        err: &dyn std::fmt::Display,
+    ) -> CommitIoFailure {
+        let finality = if matches!(state.commit_state, CommitState::Committing) {
+            pager.commit_finality()
+        } else {
+            CommitFinality::NotSubmitted
+        };
+        if finality == CommitFinality::Published || state.outcome.publication.is_some() {
+            tracing::warn!("auto-checkpoint IO failed after the commit was published: {err}");
+            state
+                .outcome
+                .checkpoint_failure
+                .get_or_insert_with(|| err.to_string());
+            if finality == CommitFinality::Published {
+                pager.abandon_auto_checkpoint();
+            }
+            CommitIoFailure::CheckpointGivenUp
+        } else if finality == CommitFinality::Submitted || state.outcome.submit_attempted {
+            state.outcome.append_failed = true;
+            CommitIoFailure::AppendFailed
+        } else {
+            CommitIoFailure::NotCommitting
         }
     }
 
@@ -1658,22 +1735,13 @@ impl Program {
                     io.set_waker(waker);
                     return Ok(StepResult::IO);
                 }
-                if let Some(err) = io
-                    .get_error()
-                    .filter(|_| self.commit_published(state, pager))
+            }
+            if let Some(err) = state.io_completions.as_ref().and_then(|io| io.get_error()) {
+                // A published commit's failed auto-checkpoint IO gives the
+                // checkpoint up and lets the commit end as committed.
+                if self.classify_commit_io_failure(pager, state, &err)
+                    != CommitIoFailure::CheckpointGivenUp
                 {
-                    // The failed IO is the auto-checkpoint's, and the commit is
-                    // already durable and visible: give the checkpoint up and
-                    // let the commit end as committed.
-                    tracing::warn!(
-                        "auto-checkpoint IO failed after the commit was published: {err}"
-                    );
-                    state
-                        .outcome
-                        .checkpoint_failure
-                        .get_or_insert_with(|| err.to_string());
-                    pager.abandon_auto_checkpoint();
-                } else if let Some(err) = io.get_error() {
                     if pager.is_checkpointing() {
                         // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
                         // so that abort() knows not to try to rollback the transaction, because the transaction
@@ -1695,8 +1763,8 @@ impl Program {
                     }
                     return Err(err);
                 }
-                state.io_completions = None;
             }
+            state.io_completions = None;
             // invalidate row
             let _ = state.result_row.take();
             let (insn, _) = &self.insns[state.pc as usize];
@@ -2201,19 +2269,19 @@ impl Program {
             Ok(IOResult::Done(()))
         };
         tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
+        if !rollback {
+            // The evidence this call left belongs to this execution: taken
+            // before an IO or an error leaves the commit's driver.
+            program_state
+                .outcome
+                .absorb_commit_evidence(pager.take_commit_evidence(), txn_finish_result.is_err());
+        }
         match txn_finish_result? {
             IOResult::Done(_) => {
-                program_state.outcome.transaction_generation =
-                    Some(connection.transaction_generation());
-                if !rollback {
-                    program_state.outcome.publication = pager.take_commit_publication();
-                    if let Some(failure) = pager.take_abandoned_checkpoint_failure() {
-                        program_state
-                            .outcome
-                            .checkpoint_failure
-                            .get_or_insert(failure);
-                    }
-                }
+                program_state
+                    .outcome
+                    .transaction_generation
+                    .get_or_insert(connection.transaction_generation());
                 // Main pager commit done, now commit attached database pagers
                 match self.end_attached_write_txns(connection, rollback)? {
                     IOResult::Done(_) => {

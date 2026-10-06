@@ -1049,6 +1049,19 @@ pub(crate) enum CommitFinality {
     Published,
 }
 
+/// Evidence of this pager's commit in progress. The statement driving the
+/// commit takes it right after each `commit_tx` call it makes, so evidence
+/// reaches its execution even when the call returns IO or an error.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CommitEvidence {
+    /// Submitting the commit append was attempted: from here on a failure
+    /// may leave the append in the WAL.
+    pub(crate) submit_attempted: bool,
+    pub(crate) publication: Option<CommitPublication>,
+    /// Why the published commit's auto-checkpoint failed and was given up.
+    pub(crate) checkpoint_failure: Option<String>,
+}
+
 /// What a published commit left in the WAL, recorded at publication for the
 /// statement that drove the commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1141,6 +1154,9 @@ struct CommitInfo {
     page_sources: Vec<PageSource>,
     page_source_cursor: usize,
     prepared_frames: Vec<PreparedFrames>,
+    /// A teardown is finishing this commit: once published it ends without
+    /// starting its auto-checkpoint.
+    skip_auto_checkpoint: bool,
     /// The BeforeIrreversibleCommit test hook already ran for this commit.
     #[cfg(any(test, feature = "commit_test_hooks"))]
     submit_hook_seen: bool,
@@ -1163,6 +1179,7 @@ impl CommitInfo {
         self.page_sources.clear();
         self.prepared_frames.clear();
         self.page_source_cursor = 0;
+        self.skip_auto_checkpoint = false;
         #[cfg(any(test, feature = "commit_test_hooks"))]
         {
             self.submit_hook_seen = false;
@@ -1431,15 +1448,15 @@ pub struct Pager {
     #[cfg(target_vendor = "apple")]
     sync_type: AtomicFileSyncType,
     checkpoint_observer: Option<Arc<dyn CheckpointObserver>>,
-    /// Set when this pager's commit is published; taken by the statement
-    /// that drove the commit.
-    commit_publication: RwLock<Option<CommitPublication>>,
-    /// Why the published commit's auto-checkpoint failed and was given up;
-    /// taken like `commit_publication`.
-    abandoned_checkpoint_failure: RwLock<Option<String>>,
+    /// Evidence of the commit in progress; see `CommitEvidence`.
+    commit_evidence: RwLock<CommitEvidence>,
     /// Test-only commit pause points of this connection's pager.
     #[cfg(any(test, feature = "commit_test_hooks"))]
     commit_hook: RwLock<Option<commit_hooks::CommitHook>>,
+    /// Whether `commit_hook` holds a hook: read first, so a commit without a
+    /// hook takes neither the hook lock nor the commit lock for it.
+    #[cfg(any(test, feature = "commit_test_hooks"))]
+    commit_hook_installed: AtomicBool,
 }
 
 assert_send_sync!(Pager);
@@ -1488,12 +1505,18 @@ pub mod commit_hooks {
                 previous.is_none(),
                 "a connection has one commit test hook at a time"
             );
+            pager
+                .commit_hook_installed
+                .store(true, crate::sync::atomic::Ordering::Release);
             Self { pager }
         }
     }
 
     impl Drop for CommitHookGuard {
         fn drop(&mut self) {
+            self.pager
+                .commit_hook_installed
+                .store(false, crate::sync::atomic::Ordering::Release);
             *self.pager.commit_hook.write() = None;
         }
     }
@@ -1700,6 +1723,7 @@ impl Pager {
                 prepared_frames: Vec::new(),
                 page_sources: Vec::new(),
                 page_source_cursor: 0,
+                skip_auto_checkpoint: false,
                 #[cfg(any(test, feature = "commit_test_hooks"))]
                 submit_hook_seen: false,
             }),
@@ -1730,15 +1754,19 @@ impl Pager {
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             checkpoint_observer,
-            commit_publication: RwLock::new(None),
-            abandoned_checkpoint_failure: RwLock::new(None),
+            commit_evidence: RwLock::new(CommitEvidence::default()),
             #[cfg(any(test, feature = "commit_test_hooks"))]
             commit_hook: RwLock::new(None),
+            #[cfg(any(test, feature = "commit_test_hooks"))]
+            commit_hook_installed: AtomicBool::new(false),
         })
     }
 
     #[cfg(any(test, feature = "commit_test_hooks"))]
     fn run_commit_hook(&self, point: commit_hooks::CommitHookPoint) -> commit_hooks::HookAction {
+        if !self.commit_hook_installed.load(Ordering::Acquire) {
+            return commit_hooks::HookAction::Continue;
+        }
         // Cloned out so the hook runs with no pager lock held.
         let hook = self.commit_hook.read().clone();
         hook.map_or(commit_hooks::HookAction::Continue, |hook| hook(point))
@@ -1776,22 +1804,25 @@ impl Pager {
         commit_info.state = CommitState::AbandonCheckpoint;
     }
 
-    /// The publication of the commit that just ended, for the statement that
-    /// drove it; None when it was not published.
-    pub(crate) fn take_commit_publication(&self) -> Option<CommitPublication> {
-        self.commit_publication.write().take()
+    /// The evidence the last `commit_tx` call left, for the statement that
+    /// made the call; it takes it before anything else can drive this pager.
+    pub(crate) fn take_commit_evidence(&self) -> CommitEvidence {
+        std::mem::take(&mut *self.commit_evidence.write())
     }
 
-    /// Why the commit that just ended gave its auto-checkpoint up, when the
-    /// checkpoint failed rather than being interrupted.
-    pub(crate) fn take_abandoned_checkpoint_failure(&self) -> Option<String> {
-        self.abandoned_checkpoint_failure.write().take()
+    /// A teardown is finishing this commit: once published it ends without
+    /// starting its auto-checkpoint.
+    pub(crate) fn skip_auto_checkpoint_after_publication(&self) {
+        self.commit_info.write().skip_auto_checkpoint = true;
     }
 
     /// Runs the BeforeIrreversibleCommit hook once per commit; true if it
     /// asked to yield before the commit append is submitted.
     #[cfg(any(test, feature = "commit_test_hooks"))]
     fn yield_before_irreversible_commit(&self) -> bool {
+        if !self.commit_hook_installed.load(Ordering::Acquire) {
+            return false;
+        }
         if std::mem::replace(&mut self.commit_info.write().submit_hook_seen, true) {
             return false;
         }
@@ -2996,8 +3027,7 @@ impl Pager {
         if self.commit_info.read().state == CommitState::PrepareWal {
             // A new commit starts: evidence an earlier commit left behind
             // belongs to no statement now.
-            self.commit_publication.write().take();
-            self.abandoned_checkpoint_failure.write().take();
+            *self.commit_evidence.write() = CommitEvidence::default();
         }
 
         let complete_commit = || {
@@ -3033,7 +3063,10 @@ impl Pager {
                         Ok(IOResult::Done(_)) => complete_commit(),
                         Err(err) => {
                             tracing::debug!("auto-checkpoint failed: {err}");
-                            *self.abandoned_checkpoint_failure.write() = Some(err.to_string());
+                            self.commit_evidence
+                                .write()
+                                .checkpoint_failure
+                                .get_or_insert_with(|| err.to_string());
                             self.commit_info.write().state = CommitState::AbandonCheckpoint;
                             continue;
                         }
@@ -4199,6 +4232,9 @@ impl Pager {
                     for prepared in &commit_info.prepared_frames {
                         batch.writev(prepared.offset, &prepared.bufs);
                     }
+                    // From here a failure, even one returned by the submission
+                    // itself, may leave the append in the WAL.
+                    self.commit_evidence.write().submit_attempted = true;
                     commit_info.completions = batch.submit()?;
                     commit_info.completion_group = None;
                     commit_info.state = CommitState::WaitWrites;
@@ -4284,14 +4320,15 @@ impl Pager {
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
-                    *self.commit_publication.write() = Some(CommitPublication {
+                    self.commit_evidence.write().publication = Some(CommitPublication {
                         transaction_count: wal.last_commit_transaction_count(),
                         max_frame: wal.get_max_frame(),
                     });
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 
-                    let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
+                    let need_checkpoint = !commit_info.skip_auto_checkpoint
+                        && allowed_auto_actions.contains(WalAutoActions::Checkpoint)
                         && wal.should_checkpoint();
                     if need_checkpoint {
                         commit_info.state = CommitState::AutoCheckpoint;
