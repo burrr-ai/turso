@@ -6590,6 +6590,45 @@ mod commit_finality_tests {
         assert_eq!(count_rows(&conn, &io), 2);
     }
 
+    /// A hook belongs to the connection it was installed on: a commit on
+    /// another connection of the same database never calls it.
+    #[test]
+    fn commit_hook_is_not_called_for_another_connections_commit() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), "commit-hook-per-connection.db")
+            .expect("the database opens");
+        let hooked = db.connect().expect("the hooked connection");
+        let other = db.connect().expect("another connection");
+        hooked
+            .execute("CREATE TABLE t(v)")
+            .expect("the table is created");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _guard = hooked.install_commit_test_hook({
+            let calls = calls.clone();
+            Arc::new(move |_: CommitHookPoint| -> HookAction {
+                calls.fetch_add(1, Ordering::SeqCst);
+                HookAction::Continue
+            })
+        });
+        other
+            .execute("INSERT INTO t VALUES (1)")
+            .expect("the other connection commits");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "commit_hook_per_connection: another connection's commit called the hook"
+        );
+        hooked
+            .execute("INSERT INTO t VALUES (2)")
+            .expect("the hooked connection commits");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the hooked connection's own commit reaches both commit points"
+        );
+        assert_eq!(count_rows(&other, &io), 2);
+    }
+
     /// The pinned engine answers this interrupt by rolling the published
     /// commit back, which releases the WAL write lock a second time and trips
     /// `WalFile::end_write_tx`'s assertion. The commit must finish instead;
