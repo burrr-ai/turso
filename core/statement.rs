@@ -1086,13 +1086,18 @@ impl Statement {
             if self.query_mode == QueryMode::Normal
                 && self.program.change_cnt_on
                 && self.has_returned_row
+                && append_error.is_none()
             {
                 // Write statement with RETURNING, user got at least one Row.
                 // With ephemeral-buffered RETURNING, ALL DML completed before any
                 // rows were yielded. The remaining work is just the scan-back
-                // (in-memory) + Halt. Commit the transaction via halt().
+                // (in-memory) + Halt. Commit the transaction via halt(). A commit
+                // already in flight ends like any teardown's: no new
+                // auto-checkpoint, and its failed IO classified.
                 let mut halt_completed = false;
                 loop {
+                    self.program
+                        .hold_teardown_boundary(&self.state, &self.pager);
                     match vdbe::execute::halt(
                         &self.program,
                         &mut self.state,
@@ -1105,14 +1110,33 @@ impl Statement {
                             halt_completed = true;
                             break;
                         }
-                        Ok(vdbe::execute::InsnFunctionStepResult::IO(_)) => {
-                            if let Err(e) = self.pager.io.step() {
-                                capture_reset_error(
-                                    &mut reset_error,
-                                    e,
-                                    "Error committing during statement reset",
-                                );
-                                break;
+                        Ok(vdbe::execute::InsnFunctionStepResult::IO(io)) => {
+                            let Err(err) = io.wait(self.pager.io.as_ref()) else {
+                                continue;
+                            };
+                            match self.program.classify_commit_io_failure(
+                                &self.pager,
+                                &mut self.state,
+                                &err,
+                            ) {
+                                vdbe::CommitIoFailure::CheckpointGivenUp => {}
+                                vdbe::CommitIoFailure::AppendFailed => {
+                                    append_error = Some(err.clone());
+                                    capture_reset_error(
+                                        &mut reset_error,
+                                        err,
+                                        "The commit append failed while committing during statement reset",
+                                    );
+                                    break;
+                                }
+                                vdbe::CommitIoFailure::NotCommitting => {
+                                    capture_reset_error(
+                                        &mut reset_error,
+                                        err,
+                                        "Error committing during statement reset",
+                                    );
+                                    break;
+                                }
                             }
                         }
                         Err(e) => {
@@ -1140,9 +1164,10 @@ impl Statement {
                 if halt_completed {
                     self.terminal = Some(RootTerminal::Done);
                 } else {
+                    let abort_cause = append_error.as_ref().or(reset_error.as_ref());
                     if let Err(abort_err) =
                         self.program
-                            .abort(&self.pager, reset_error.as_ref(), &mut self.state)
+                            .abort(&self.pager, abort_cause, &mut self.state)
                     {
                         capture_reset_error(
                             &mut reset_error,
@@ -1154,8 +1179,9 @@ impl Statement {
                 }
             } else {
                 // Either a read-only statement, a write statement that never
-                // yielded a Row (DML still in progress or hit Busy/error), or a
-                // write statement without RETURNING. Rollback to avoid committing
+                // yielded a Row (DML still in progress or hit Busy/error), a
+                // write statement without RETURNING, or one whose failed commit
+                // append the reset observed. Rollback to avoid committing
                 // partial DML or silently retrying after transient errors (Busy).
                 if let Err(abort_err) =
                     self.program

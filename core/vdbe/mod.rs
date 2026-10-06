@@ -1608,81 +1608,95 @@ impl Program {
     /// A statement torn down (reset, drop, abort) after its commit append
     /// was submitted must not roll the transaction back: the append may be
     /// durable already. Drive the commit to its end instead; a published
-    /// commit gives its auto-checkpoint up rather than running it. Ok(false)
-    /// when there is no such commit, or when the error being handled is the
-    /// append itself failing; the caller then rolls back as before.
+    /// commit gives its auto-checkpoint up rather than running it. Returns
+    /// whether the commit ended as committed, and the error the teardown
+    /// met while driving it, for the caller to report. A commit that did not
+    /// end is rolled back by the caller as before: there is no such commit,
+    /// or its append failed and the outcome is Unknown.
     fn end_commit_past_its_append(
         &self,
         pager: &Arc<Pager>,
         err: Option<&LimboError>,
         state: &mut ProgramState,
-    ) -> Result<bool> {
+    ) -> (bool, Option<LimboError>) {
         if !matches!(state.commit_state, CommitState::Committing) {
-            return Ok(false);
+            return (false, None);
         }
         match pager.commit_finality() {
-            CommitFinality::NotSubmitted => return Ok(false),
+            CommitFinality::NotSubmitted => return (false, None),
             CommitFinality::Submitted if err.is_some() => {
                 // The append itself failed: whether the WAL holds it is unknown.
                 state.outcome.append_failed = true;
-                return Ok(false);
+                return (false, None);
             }
             CommitFinality::Submitted | CommitFinality::Published => {}
         }
-        // A teardown finishes the commit; it never starts its auto-checkpoint.
-        pager.skip_auto_checkpoint_after_publication();
         let mv_store = self.connection.mv_store();
-        loop {
-            if pager.commit_finality() == CommitFinality::Published {
-                pager.abandon_auto_checkpoint();
-            }
+        let failure = loop {
+            self.hold_teardown_boundary(state, pager);
             match self.commit_txn(pager.clone(), state, mv_store.as_ref(), false) {
-                Ok(IOResult::Done(_)) => return Ok(true),
+                Ok(IOResult::Done(_)) => return (true, None),
                 Ok(IOResult::IO(io)) => {
                     if let Err(err) = io.wait(pager.io.as_ref()) {
-                        match self.classify_commit_io_failure(pager, state, &err) {
-                            CommitIoFailure::CheckpointGivenUp => {}
-                            CommitIoFailure::AppendFailed => return Ok(false),
-                            CommitIoFailure::NotCommitting => return Err(err),
+                        if self.classify_commit_io_failure(pager, state, &err)
+                            != CommitIoFailure::CheckpointGivenUp
+                        {
+                            break err;
                         }
                     }
                 }
                 // A failed submitted append was recorded with its evidence.
-                Err(_) if state.outcome.append_failed => return Ok(false),
-                Err(err) => return Err(err),
+                Err(err) => break err,
             }
+        };
+        // A published commit is never rolled back, even when ending it failed.
+        (
+            pager.commit_finality() == CommitFinality::Published,
+            Some(failure),
+        )
+    }
+
+    /// A teardown finishes a commit in flight; it never starts its
+    /// auto-checkpoint, and gives up one already running.
+    pub(crate) fn hold_teardown_boundary(&self, state: &ProgramState, pager: &Pager) {
+        if !matches!(state.commit_state, CommitState::Committing) {
+            return;
+        }
+        pager.skip_auto_checkpoint_after_publication();
+        if pager.commit_finality() == CommitFinality::Published {
+            pager.abandon_auto_checkpoint();
         }
     }
 
-    /// Classifies a failed IO of this execution against the commit it drives
-    /// and records what it means. The step, the teardown and the reset all
-    /// classify through here.
+    /// Classifies a failed IO of this execution against the main WAL commit
+    /// it drives and records what it means. The step, the teardown and the
+    /// reset all classify through here. Only the IO of a main WAL commit in
+    /// flight classifies: a failed attached or MVCC commit IO keeps its
+    /// existing error handling, even after the main commit was published.
     pub(crate) fn classify_commit_io_failure(
         &self,
         pager: &Pager,
         state: &mut ProgramState,
         err: &dyn std::fmt::Display,
     ) -> CommitIoFailure {
-        let finality = if matches!(state.commit_state, CommitState::Committing) {
-            pager.commit_finality()
-        } else {
-            CommitFinality::NotSubmitted
-        };
-        if finality == CommitFinality::Published || state.outcome.publication.is_some() {
-            tracing::warn!("auto-checkpoint IO failed after the commit was published: {err}");
-            state
-                .outcome
-                .checkpoint_failure
-                .get_or_insert_with(|| err.to_string());
-            if finality == CommitFinality::Published {
+        if !matches!(state.commit_state, CommitState::Committing) {
+            return CommitIoFailure::NotCommitting;
+        }
+        match pager.commit_finality() {
+            CommitFinality::Published => {
+                tracing::warn!("auto-checkpoint IO failed after the commit was published: {err}");
+                state
+                    .outcome
+                    .checkpoint_failure
+                    .get_or_insert_with(|| err.to_string());
                 pager.abandon_auto_checkpoint();
+                CommitIoFailure::CheckpointGivenUp
             }
-            CommitIoFailure::CheckpointGivenUp
-        } else if finality == CommitFinality::Submitted || state.outcome.submit_attempted {
-            state.outcome.append_failed = true;
-            CommitIoFailure::AppendFailed
-        } else {
-            CommitIoFailure::NotCommitting
+            CommitFinality::Submitted => {
+                state.outcome.append_failed = true;
+                CommitIoFailure::AppendFailed
+            }
+            CommitFinality::NotSubmitted => CommitIoFailure::NotCommitting,
         }
     }
 
@@ -2447,20 +2461,17 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         let top_level = !self.connection.is_nested_stmt() && !self.is_trigger_subprogram();
-        let commit_ended = top_level
-            && match self.end_commit_past_its_append(pager, err, state) {
-                Ok(ended) => ended,
-                Err(end_err) => {
-                    capture_abort_error(
-                        &mut abort_error,
-                        end_err,
-                        "Failed to end a submitted commit during abort",
-                    );
-                    // A published commit is never rolled back, even when
-                    // ending it failed.
-                    pager.commit_finality() == CommitFinality::Published
-                }
-            };
+        let commit_ended = top_level && {
+            let (ended, end_err) = self.end_commit_past_its_append(pager, err, state);
+            if let Some(end_err) = end_err {
+                capture_abort_error(
+                    &mut abort_error,
+                    end_err,
+                    "Failed to end a submitted commit during abort",
+                );
+            }
+            ended
+        };
         if top_level && !commit_ended {
             let owns_auto_txn = state.owns_auto_txn();
             if err.is_some() && !pager.is_checkpointing() {
