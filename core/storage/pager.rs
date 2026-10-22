@@ -48,6 +48,9 @@ use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min, PayloadLimits,
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
+use super::shared_page_cache::{
+    SharedPageCacheNamespace, SharedPageCachePublisher, SharedPageVersion,
+};
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
@@ -152,6 +155,7 @@ mod page_inner {
         data_len: usize,
         /// Overflow cells during btree operations
         pub overflow_cells: crate::alloc::Vec<OverflowCell>,
+        pub(super) shared_page_publisher: Option<SharedPageCachePublisher>,
     }
 
     // SAFETY: data_ptr and data_len only cache the address and length of the
@@ -186,6 +190,7 @@ mod page_inner {
                 data_ptr: std::ptr::NonNull::dangling(),
                 data_len: 0,
                 overflow_cells: crate::alloc::vec![],
+                shared_page_publisher: None,
             }
         }
 
@@ -1092,6 +1097,14 @@ impl Page {
         self.get().flags.fetch_and(!PAGE_LOADED, Ordering::Release);
     }
 
+    fn set_shared_page_publisher(&self, publisher: Option<SharedPageCachePublisher>) {
+        self.get().shared_page_publisher = publisher;
+    }
+
+    pub(crate) fn take_shared_page_publisher(&self) -> Option<SharedPageCachePublisher> {
+        self.get().shared_page_publisher.take()
+    }
+
     #[inline]
     pub fn is_index(&self) -> crate::Result<bool> {
         Ok(match self.get_contents().page_type()? {
@@ -1585,6 +1598,8 @@ pub struct Pager {
     pub(crate) wal: Option<Arc<dyn Wal>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
+    /// Optional database-lifetime cache of immutable clean page bytes.
+    shared_page_cache: Option<SharedPageCacheNamespace>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
@@ -1889,6 +1904,41 @@ pub struct CollectingState {
     pub completions: Vec<Completion>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ResolvedPageSource {
+    Database {
+        checkpoint_epoch: Option<u32>,
+    },
+    Wal {
+        frame_id: u64,
+        checkpoint_epoch: Option<u32>,
+    },
+}
+
+impl ResolvedPageSource {
+    fn shared_version(self) -> Option<SharedPageVersion> {
+        match self {
+            Self::Database {
+                checkpoint_epoch: Some(checkpoint_epoch),
+            } => Some(SharedPageVersion::Database { checkpoint_epoch }),
+            Self::Database {
+                checkpoint_epoch: None,
+            } => None,
+            Self::Wal {
+                frame_id,
+                checkpoint_epoch: Some(checkpoint_epoch),
+            } => Some(SharedPageVersion::Wal {
+                frame_id,
+                checkpoint_epoch,
+            }),
+            Self::Wal {
+                checkpoint_epoch: None,
+                ..
+            } => None,
+        }
+    }
+}
+
 impl Pager {
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
@@ -1899,6 +1949,29 @@ impl Pager {
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
     ) -> Result<Self> {
+        Self::new_with_shared_page_cache(
+            db_file,
+            wal,
+            io,
+            page_cache,
+            buffer_pool,
+            init_lock,
+            init_page_1,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_shared_page_cache(
+        db_file: Arc<dyn DatabaseStorage>,
+        wal: Option<Arc<dyn Wal>>,
+        io: Arc<dyn crate::io::IO>,
+        page_cache: PageCache,
+        buffer_pool: Arc<BufferPool>,
+        init_lock: Arc<Mutex<()>>,
+        init_page_1: Arc<ArcSwapOption<Page>>,
+        shared_page_cache: Option<SharedPageCacheNamespace>,
+    ) -> Result<Self> {
         let allocate_page1_state = if init_page_1.load().is_some() {
             RwLock::new(AllocatePage1State::Start)
         } else {
@@ -1908,6 +1981,7 @@ impl Pager {
             db_file,
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
+            shared_page_cache,
             io,
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
@@ -3569,41 +3643,109 @@ impl Pager {
     ) -> Result<(PageRef, Completion)> {
         turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
-        let page = Arc::new(Page::new(page_idx));
-        let io_ctx = self.io_ctx.read();
+        let source = self.resolve_page_source(page_idx, frame_watermark)?;
+        self.read_page_from_source(page_idx, source, allow_empty_read, None, group)
+    }
+
+    fn resolve_page_source(
+        &self,
+        page_idx: i64,
+        frame_watermark: Option<u64>,
+    ) -> Result<ResolvedPageSource> {
         let Some(wal) = self.wal.as_ref() else {
             turso_assert!(
                 matches!(frame_watermark, Some(0) | None),
                 "frame_watermark must be either None or Some(0) because DB has no WAL and read with other watermark is invalid"
             );
 
-            page.set_locked();
-            let c = self.begin_read_disk_page(
-                page_idx as usize,
-                page.clone(),
-                allow_empty_read,
-                &io_ctx,
-                group,
-            )?;
-            return Ok((page, c));
+            return Ok(ResolvedPageSource::Database {
+                checkpoint_epoch: None,
+            });
         };
 
-        if let Some(frame_id) = wal.find_frame(page_idx as u64, frame_watermark)? {
-            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone(), group)?;
-            // TODO(pere) should probably first insert to page cache, and if successful,
-            // read frame or page
-            return Ok((page, c));
+        let frame_id = wal.find_frame(page_idx as u64, frame_watermark)?;
+        let checkpoint_epoch = wal.shared_page_cache_epoch();
+        Ok(match frame_id {
+            Some(frame_id) => ResolvedPageSource::Wal {
+                frame_id,
+                checkpoint_epoch: checkpoint_epoch
+                    .filter(|_| frame_id <= wal.get_max_frame_in_wal()),
+            },
+            None => ResolvedPageSource::Database { checkpoint_epoch },
+        })
+    }
+
+    fn read_page_from_source(
+        &self,
+        page_idx: i64,
+        source: ResolvedPageSource,
+        allow_empty_read: bool,
+        publisher: Option<SharedPageCachePublisher>,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<(PageRef, Completion)> {
+        let page = Arc::new(Page::new(page_idx));
+        page.set_shared_page_publisher(publisher);
+        let io_ctx = self.io_ctx.read();
+        let completion = match source {
+            ResolvedPageSource::Database { .. } => {
+                page.set_locked();
+                self.begin_read_disk_page(
+                    page_idx as usize,
+                    page.clone(),
+                    allow_empty_read,
+                    &io_ctx,
+                    group,
+                )?
+            }
+            ResolvedPageSource::Wal { frame_id, .. } => {
+                let wal = self
+                    .wal
+                    .as_ref()
+                    .expect("resolved WAL page source requires a WAL");
+                wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone(), group)?
+            }
+        };
+        Ok((page, completion))
+    }
+
+    fn read_shared_page(&self, page_idx: i64, source: ResolvedPageSource) -> Option<PageRef> {
+        let namespace = self.shared_page_cache.as_ref()?;
+        let version = source.shared_version()?;
+        let page_size = self.get_page_size_unchecked().get();
+        let bytes = namespace.get(page_idx as usize, page_size, version)?;
+        if bytes.len() != page_size as usize {
+            return None;
         }
 
-        page.set_locked();
-        let c = self.begin_read_disk_page(
+        let buffer = self.buffer_pool.get_page();
+        if buffer.len() != bytes.len() {
+            return None;
+        }
+        buffer.as_mut_slice().copy_from_slice(bytes.as_ref());
+        let page = Arc::new(Page::new(page_idx));
+        sqlite3_ondisk::finish_read_page(page_idx as usize, Arc::new(buffer), page.clone());
+        if let ResolvedPageSource::Wal {
+            frame_id,
+            checkpoint_epoch: Some(checkpoint_epoch),
+        } = source
+        {
+            page.set_wal_tag(frame_id, checkpoint_epoch);
+        }
+        Some(page)
+    }
+
+    fn shared_page_publisher(
+        &self,
+        page_idx: i64,
+        source: ResolvedPageSource,
+    ) -> Option<SharedPageCachePublisher> {
+        let namespace = self.shared_page_cache.as_ref()?;
+        let version = source.shared_version()?;
+        Some(namespace.publisher(
             page_idx as usize,
-            page.clone(),
-            allow_empty_read,
-            &io_ctx,
-            group,
-        )?;
-        Ok((page, c))
+            self.get_page_size_unchecked().get(),
+            version,
+        ))
     }
 
     /// Issue a non-blocking page read, inserting into the page cache, may spill to disk.
@@ -3679,16 +3821,24 @@ impl Pager {
                 }
             }
 
-            tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
-            let (page, c) = self.read_page_no_cache(page_idx, None, false, group)?;
+            let source = self.resolve_page_source(page_idx, None)?;
+            let (page, c_disk) = if let Some(page) = self.read_shared_page(page_idx, source) {
+                (page, None)
+            } else {
+                tracing::debug!("read_page(page_idx = {page_idx}) = reading page from storage");
+                let publisher = self.shared_page_publisher(page_idx, source);
+                let (page, c) =
+                    self.read_page_from_source(page_idx, source, false, publisher, group)?;
+                (page, Some(c))
+            };
             self.insert_pending_read(
                 page_idx,
                 PendingRead {
                     page: page.clone(),
-                    disk_read: Some(c.clone()),
+                    disk_read: c_disk.clone(),
                 },
             );
-            (page, Some(c))
+            (page, c_disk)
         };
 
         match self.cache_insert(page_idx as usize, page.clone())? {

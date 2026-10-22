@@ -563,6 +563,7 @@ pub fn begin_read_page(
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((buf, bytes_read)) = res else {
             page.clear_locked();
+            page.take_shared_page_publisher();
             return None; // IO error already captured in completion
         };
         let buf_len = buf.len();
@@ -572,6 +573,7 @@ pub fn begin_read_page(
             if !allow_empty_read {
                 tracing::error!("short read on page {page_idx}: expected {buf_len} bytes, got 0");
                 page.clear_locked();
+                page.take_shared_page_publisher();
                 return Some(CompletionError::ShortRead {
                     page_idx,
                     expected: buf_len,
@@ -583,6 +585,7 @@ pub fn begin_read_page(
                 "short read on page {page_idx}: expected {buf_len} bytes, got {bytes_read}"
             );
             page.clear_locked();
+            page.take_shared_page_publisher();
             return Some(CompletionError::ShortRead {
                 page_idx,
                 expected: buf_len,
@@ -608,14 +611,18 @@ pub fn begin_read_page(
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
-    {
+    let publisher = {
         let inner = page.get();
-        inner.set_buffer(buffer);
+        inner.set_buffer(buffer.clone());
         page.clear_locked();
         page.set_loaded();
         // we set the wal tag only when reading page from log, or in allocate_page,
         // we clear it here for safety in case page is being re-loaded.
         page.clear_wal_tag();
+        page.take_shared_page_publisher()
+    };
+    if let Some(publisher) = publisher {
+        publisher.publish(buffer.as_slice());
     }
 }
 

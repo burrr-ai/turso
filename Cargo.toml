@@ -169,6 +169,7 @@ asserting = "0.16"
 bitmaps = { version = "3.2.1", default-features = false }
 console-subscriber = { version = "0.4.1" }
 either = { version = "1.15" }
+lru = "0.16.4"
 windows-sys = "0.61.2"
 
 # Multi threading testing

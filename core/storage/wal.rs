@@ -772,6 +772,9 @@ pub trait Wal: Debug + Send + Sync {
     fn is_dirty(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
+    fn shared_page_cache_epoch(&self) -> Option<u32> {
+        None
+    }
     fn get_max_frame(&self) -> u64;
     /// This connection's frozen `(checkpoint_seq, max_frame)`: for a reader it is the WAL read
     /// mark installed at `begin_read_tx`; for a writer it is the position after its last commit.
@@ -3714,6 +3717,7 @@ impl Wal for WalFile {
                 tracing::debug!(err = ?res.unwrap_err());
                 page.clear_locked();
                 page.clear_wal_tag();
+                page.take_shared_page_publisher();
                 return None; // IO error already captured in completion
             };
             let buf_len = buf.len();
@@ -3723,6 +3727,7 @@ impl Wal for WalFile {
                 );
                 page.clear_locked();
                 page.clear_wal_tag();
+                page.take_shared_page_publisher();
                 return Some(CompletionError::ShortReadWalFrame {
                     offset,
                     expected: buf_len,
@@ -4200,6 +4205,10 @@ impl Wal for WalFile {
 
     fn get_checkpoint_seq(&self) -> u32 {
         self.load_coordination_snapshot().checkpoint_seq
+    }
+
+    fn shared_page_cache_epoch(&self) -> Option<u32> {
+        Some(self.coordination.checkpoint_epoch())
     }
 
     fn get_max_frame(&self) -> u64 {

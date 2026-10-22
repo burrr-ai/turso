@@ -34,6 +34,7 @@ use crate::{
         page_cache::PageCache,
         page_transform::PageTransform,
         pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut},
+        shared_page_cache::{SharedPageCache, SharedPageCacheNamespace},
         sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
@@ -617,9 +618,7 @@ pub struct Database<
     wal_path: String,
     pub io: Arc<dyn IO>,
     pub(crate) buffer_pool: Arc<BufferPool>,
-    // Shared structures of a Database are the parts that are common to multiple threads that might
-    // create DB connections.
-    _shared_page_cache: Arc<RwLock<PageCache>>,
+    shared_page_cache: RwLock<Option<SharedPageCacheNamespace>>,
 
     /// Optional per-database MVCC durable storage override.
     ///
@@ -694,12 +693,11 @@ impl fmt::Debug for Database {
         };
         debug_struct.field("wal_state", &wal_status);
 
-        // Page cache info (just basic stats, not full contents)
-        let cache_info = match self._shared_page_cache.try_read() {
-            Some(cache) => format!("( capacity {}, used: {} )", cache.capacity(), cache.len()),
-            None => "locked".to_string(),
-        };
-        debug_struct.field("page_cache", &cache_info);
+        let shared_page_cache = self
+            .shared_page_cache
+            .try_read()
+            .map(|cache| cache.is_some());
+        debug_struct.field("shared_page_cache", &shared_page_cache);
 
         debug_struct.field(
             "n_connections",
@@ -715,6 +713,10 @@ impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
+    }
+
+    pub fn set_shared_page_cache(&self, cache: Option<Arc<SharedPageCache>>) {
+        *self.shared_page_cache.write() = cache.map(|cache| cache.new_namespace());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -737,7 +739,6 @@ impl Database {
 
         let db_size = db_file.size()?;
 
-        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
         let syms = SymbolTable::new();
         let arena_size = if std::env::var("TESTING").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
             BufferPool::TEST_ARENA_SIZE
@@ -771,7 +772,7 @@ impl Database {
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),
-            _shared_page_cache: shared_page_cache,
+            shared_page_cache: RwLock::new(None),
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
@@ -3206,7 +3207,7 @@ impl Database {
             None
         };
 
-        let pager = Pager::new(
+        let pager = Pager::new_with_shared_page_cache(
             self.db_file.clone(),
             pager_wal,
             self.io.clone(),
@@ -3214,6 +3215,7 @@ impl Database {
             buffer_pool,
             self.init_lock.clone(),
             self.init_page_1.clone(),
+            self.shared_page_cache.read().clone(),
         )?;
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
