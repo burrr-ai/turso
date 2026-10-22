@@ -697,7 +697,7 @@ impl Drop for Buffer {
         match self {
             Self::Heap(buf) | Self::HeapView { data: buf, .. } => {
                 let underlying_len = buf.len();
-                TEMP_BUFFER_CACHE.with(|cache| {
+                let _ = TEMP_BUFFER_CACHE.try_with(|cache| {
                     let mut cache = cache.borrow_mut();
                     // take ownership of the buffer by swapping it with a dummy
                     let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
@@ -836,6 +836,76 @@ crate::thread::thread_local! {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    std::thread_local! {
+        static BUFFER_DROPPED_DURING_THREAD_EXIT: RefCell<Option<Buffer>> =
+            const { RefCell::new(None) };
+    }
+
+    #[test]
+    fn buffer_tls_teardown_child() {
+        let Ok(case) = std::env::var("TURSO_BUFFER_TLS_CASE") else {
+            return;
+        };
+        std::thread::spawn(move || {
+            BUFFER_DROPPED_DURING_THREAD_EXIT.with(|slot| {
+                let temporary = Buffer::new_temporary(4096);
+                let buffer = match case.as_str() {
+                    "heap" | "early" => temporary,
+                    "view" => {
+                        drop(temporary);
+                        Buffer::new_with_start(vec![7; 4096], 16)
+                    }
+                    _ => unreachable!("unknown TLS test case"),
+                };
+                assert!(TEMP_BUFFER_CACHE.try_with(|_| ()).is_ok());
+                eprintln!("TLS_CASE_READY:{case}");
+                slot.replace(Some(buffer));
+                if case == "early" {
+                    drop(slot.take());
+                }
+            });
+        })
+        .join()
+        .expect("buffer drop must complete during thread-local teardown");
+    }
+
+    #[test]
+    fn buffer_tls_teardown_heap() {
+        check_tls_teardown("heap");
+    }
+
+    #[test]
+    fn buffer_tls_teardown_view() {
+        check_tls_teardown("view");
+    }
+
+    #[test]
+    fn buffer_tls_teardown_early_drop() {
+        check_tls_teardown("early");
+    }
+
+    fn check_tls_teardown(case: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "io::buffer_tests::buffer_tls_teardown_child",
+                "--nocapture",
+            ])
+            .env("TURSO_BUFFER_TLS_CASE", case)
+            .output()
+            .expect("TLS child process starts");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("TLS_CASE_READY:{case}")),
+            "{stderr}"
+        );
+        assert!(
+            output.status.success(),
+            "case={case} status={} stderr={stderr}",
+            output.status
+        );
+    }
 
     fn shared_bytes(bytes: &[u8]) -> Arc<DynBoxedSlice<u8>> {
         let mut data =
