@@ -50,6 +50,37 @@ use crate::{
     Result, SyncMode,
 };
 
+#[cfg(test)]
+pub(crate) mod restart_unlock_test {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct HookGuard;
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            let _ = HOOK.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    pub(crate) fn install(hook: impl FnOnce() + 'static) -> HookGuard {
+        HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+        });
+        HookGuard
+    }
+
+    pub(super) fn run() {
+        let hook = HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// this contains the frame to rollback to and its associated checksum.
 #[derive(Debug, Clone)]
 pub struct RollbackTo {
@@ -5199,6 +5230,7 @@ impl WalFile {
                     // This ensures data durability: if a crash occurs after WAL truncation
                     // but before DB sync, the data would be lost. By truncating the WAL
                     // only after the DB is safely synced, we guarantee recoverability.
+                    self.increment_checkpoint_epoch();
                     if mode.should_restart_log() {
                         Self::unlock_after_restart(&self.coordination, None);
                     }
@@ -5212,8 +5244,6 @@ impl WalFile {
                         };
                         checkpoint_result.take().unwrap()
                     };
-                    // increment wal epoch to ensure no stale pages are used for backfilling
-                    self.increment_checkpoint_epoch();
 
                     tracing::debug!("checkpoint_result={:?}", checkpoint_result);
                     // we cannot truncate the db file here because we are currently inside a
@@ -5395,6 +5425,10 @@ impl WalFile {
     // unlock shared read locks taken by RESTART/TRUNCATE checkpoint modes
     fn unlock_after_restart(coordination: &Arc<dyn WalCoordination>, e: Option<&LimboError>) {
         coordination.end_restart();
+        #[cfg(test)]
+        if e.is_none() {
+            restart_unlock_test::run();
+        }
         if let Some(e) = e {
             mark_unlikely();
             tracing::debug!(

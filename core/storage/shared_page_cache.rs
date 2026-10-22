@@ -2115,6 +2115,207 @@ mod tests {
 
     #[cfg(feature = "fs")]
     #[test]
+    fn restart_unlock_does_not_expose_the_previous_database_epoch() {
+        read_at_restart_unlock("RESTART", false);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn truncate_unlock_does_not_expose_the_previous_database_epoch() {
+        read_at_restart_unlock("TRUNCATE", false);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn restart_unlock_write_upgrade_does_not_lose_a_committed_update() {
+        read_at_restart_unlock("RESTART", true);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn truncate_unlock_write_upgrade_does_not_lose_a_committed_update() {
+        read_at_restart_unlock("TRUNCATE", true);
+    }
+
+    #[cfg(feature = "fs")]
+    fn read_at_restart_unlock(mode: &str, upgrade: bool) {
+        let (directory, database, cache) = database_with_cache();
+        let writer = database.connect().unwrap();
+        seed_rows(&writer, 64);
+        writer
+            .execute("UPDATE test SET value = 'before' WHERE id = 1")
+            .unwrap();
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let old_reader = database.connect().unwrap();
+        let tail_reader = database.connect().unwrap();
+        tail_reader.set_busy_timeout(std::time::Duration::ZERO);
+        old_reader.execute("BEGIN").unwrap();
+        assert_eq!(read_first_value(&old_reader), "before");
+        let epoch = writer
+            .get_pager()
+            .wal
+            .as_ref()
+            .unwrap()
+            .shared_page_cache_epoch();
+        writer
+            .execute("UPDATE test SET value = 'after!' WHERE id = 1")
+            .unwrap();
+        old_reader.get_pager().clear_page_cache(false);
+        let before = cache.stats().hits;
+        assert_eq!(read_first_value(&old_reader), "before");
+        assert!(cache.stats().hits > before);
+        old_reader.execute("COMMIT").unwrap();
+        tail_reader.get_pager().clear_page_cache(false);
+        assert_eq!(
+            writer
+                .get_pager()
+                .wal
+                .as_ref()
+                .unwrap()
+                .shared_page_cache_epoch(),
+            epoch
+        );
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let captured = observed.clone();
+        let boundary_reader = tail_reader.clone();
+        let boundary_cache = cache.clone();
+        let _hook = crate::storage::wal::restart_unlock_test::install(move || {
+            assert_eq!(
+                boundary_reader
+                    .get_pager()
+                    .wal
+                    .as_ref()
+                    .unwrap()
+                    .get_max_frame_in_wal(),
+                0
+            );
+            let boundary_epoch = boundary_reader
+                .get_pager()
+                .wal
+                .as_ref()
+                .unwrap()
+                .shared_page_cache_epoch();
+            boundary_reader.execute("BEGIN").unwrap();
+            let hits_before = boundary_cache.stats().hits;
+            let value = try_read_first_value(&boundary_reader);
+            let hits = boundary_cache.stats().hits - hits_before;
+            assert!(!boundary_reader.get_auto_commit());
+            *captured.lock().unwrap() = Some((value, boundary_epoch, hits));
+        });
+        writer
+            .execute(format!("PRAGMA wal_checkpoint({mode})"))
+            .expect("checkpoint must complete; setup failures are not stale-read evidence");
+        let (boundary_result, boundary_epoch, boundary_hits) = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("restart-unlock hook must have observed the boundary reader");
+        let (first, boundary_status) = match boundary_result {
+            Ok(value) => (value, "read"),
+            Err(crate::LimboError::Busy | crate::LimboError::BusySnapshot) => (
+                read_first_value(&tail_reader),
+                "rejected_until_checkpoint_return",
+            ),
+            Err(error) => unreachable!("unexpected boundary read error: {error:?}"),
+        };
+        let after_finalize = read_first_value(&tail_reader);
+        let last_read = read_first_value(&tail_reader);
+        let outcome = if upgrade {
+            match tail_reader.execute(format!(
+                "UPDATE test SET value = '{first}-reader' WHERE id = 1"
+            )) {
+                Ok(()) => {
+                    tail_reader.execute("COMMIT").unwrap();
+                    "committed".to_string()
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error,
+                            crate::LimboError::Busy | crate::LimboError::BusySnapshot
+                        ),
+                        "unexpected write-upgrade error: {error:?}"
+                    );
+                    tail_reader.execute("ROLLBACK").unwrap();
+                    format!("{error:?}")
+                }
+            }
+        } else {
+            tail_reader.execute("COMMIT").unwrap();
+            "read_only".to_string()
+        };
+        let fresh = read_first_value(&database.connect().unwrap());
+        drop(writer);
+        drop(old_reader);
+        drop(tail_reader);
+        drop(database);
+        drop(cache);
+        let path = directory.path().join("shared-page-cache.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let cold =
+            Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+        let cold_value = read_first_value(&cold.connect().unwrap());
+        let classification = match (
+            first.as_str(),
+            after_finalize.as_str(),
+            last_read.as_str(),
+            outcome.as_str(),
+            cold_value.as_str(),
+        ) {
+            ("before", _, _, "committed", "before-reader") => "lost_update",
+            ("before", "before", "before", _, _) => "transaction_persistent",
+            ("before", "after!", "after!", _, _) => "one_read",
+            ("after!", "after!", "after!", _, _) => "no_stale_read",
+            _ => "unexpected_snapshot_change",
+        };
+        eprintln!(
+            "EPOCH_UNLOCK_OBSERVATION mode={mode} upgrade={upgrade} boundary_status={boundary_status} old_epoch={epoch:?} boundary_epoch={boundary_epoch:?} boundary_hits={boundary_hits} first={first:?} after_finalize={after_finalize:?} last_read={last_read:?} outcome={outcome} fresh={fresh:?} cold={cold_value:?} classification={classification}"
+        );
+        assert_eq!(
+            fresh, cold_value,
+            "cold reopen must preserve the committed result"
+        );
+        let expected = if outcome == "committed" {
+            "after!-reader"
+        } else {
+            "after!"
+        };
+        assert_eq!(
+            cold_value, expected,
+            "reader upgrade must not overwrite the earlier commit"
+        );
+        assert_eq!(
+            first, "after!",
+            "reader after {mode} unlock must see the backfilled commit"
+        );
+        assert_eq!(
+            after_finalize, first,
+            "snapshot must remain valid after Finalize"
+        );
+        assert_eq!(
+            last_read, first,
+            "snapshot must remain valid until transaction end"
+        );
+    }
+
+    #[cfg(feature = "fs")]
+    fn read_first_value(connection: &Arc<Connection>) -> String {
+        try_read_first_value(connection).expect("read must succeed outside the checkpoint window")
+    }
+
+    #[cfg(feature = "fs")]
+    fn try_read_first_value(connection: &Arc<Connection>) -> crate::Result<String> {
+        let mut statement = connection.prepare("SELECT value FROM test WHERE id = 1")?;
+        let mut value = None;
+        statement.run_with_row_callback(|row| {
+            value = Some(row.get(0).unwrap());
+            Ok(())
+        })?;
+        Ok(value.expect("one seeded row"))
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
     fn contested_concurrent_insertions_are_safe_and_bounded() {
         let (_directory, database, cache) = database_with_cache();
         let writer = database.connect().unwrap();
