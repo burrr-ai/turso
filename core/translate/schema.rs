@@ -1447,7 +1447,7 @@ pub fn translate_create_table(
     // `sequence_backing_table_name` then maps it to the physical
     // `__turso_internal_seq_<sequence-name>` table.
     // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
-    if has_autoincrement {
+    if has_autoincrement && connection.get_source_database(database_id).mvcc_enabled() {
         let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&normalized_tbl_name);
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
@@ -1834,11 +1834,13 @@ fn validate_drop_table(
     database_id: usize,
     tbl_name: &str,
     connection: &Arc<Connection>,
+    is_unused_autoincrement_backing: bool,
 ) -> Result<()> {
     if !connection.is_nested_stmt()
         && crate::schema::is_system_table(tbl_name)
         // special case, allow dropping `sqlite_stat1`
         && !tbl_name.eq_ignore_ascii_case(STATS_TABLE)
+        && !is_unused_autoincrement_backing
     {
         bail_parse_error!("Cannot drop system table {}", tbl_name);
     }
@@ -1875,7 +1877,15 @@ pub fn translate_drop_table(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
-    validate_drop_table(resolver, database_id, name, connection)?;
+    let unused_autoincrement_sequence =
+        unused_autoincrement_sequence(resolver, database_id, name, connection);
+    validate_drop_table(
+        resolver,
+        database_id,
+        name,
+        connection,
+        unused_autoincrement_sequence.is_some(),
+    )?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()
@@ -2494,6 +2504,12 @@ pub fn translate_drop_table(
         _p3: 0,
         table_name: tbl_name.name.as_str().to_string(),
     });
+    if let Some(seq_name) = unused_autoincrement_sequence {
+        program.emit_insn(Insn::DropSequence {
+            db: database_id,
+            seq_name,
+        });
+    }
 
     // If the dropped table owned an implicit AUTOINCREMENT sequence, tear
     // down its backing table too: destroy the B-tree root, remove the
@@ -2526,6 +2542,36 @@ pub fn translate_drop_table(
     });
 
     Ok(())
+}
+
+fn unused_autoincrement_sequence(
+    resolver: &Resolver,
+    database_id: usize,
+    table_name: &str,
+    connection: &Connection,
+) -> Option<String> {
+    if connection.get_source_database(database_id).mvcc_enabled() {
+        return None;
+    }
+    let normalized_name = normalize_ident(table_name);
+    let sequence_name = normalized_name.strip_prefix(crate::schema::SEQ_BACKING_TABLE_PREFIX)?;
+    let owner_name = sequence_name.strip_prefix(crate::schema::AUTOINCREMENT_SEQ_PREFIX)?;
+    resolver.with_schema(database_id, |schema| {
+        let owner = schema.get_btree_table(owner_name)?;
+        if !owner.has_autoincrement {
+            return None;
+        }
+        let sequence = schema.get_sequence(sequence_name)?;
+        if sequence.start_value != 1
+            || sequence.increment_by != 1
+            || sequence.min_value != 1
+            || sequence.max_value != i64::MAX
+            || sequence.cycle
+        {
+            return None;
+        }
+        Some(sequence_name.to_string())
+    })
 }
 
 /// Validate an encode or decode expression for safety.

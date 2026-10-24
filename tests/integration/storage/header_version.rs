@@ -752,6 +752,143 @@ fn test_switch_to_mvcc_inside_transaction_is_rejected() {
     assert_eq!(rows, vec![(1, "a".to_string())]);
 }
 
+#[test]
+fn test_autoincrement_wal_schema_and_ids() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("autoincrement.db");
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        let tables: Vec<(String,)> =
+            conn.exec_rows("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+        assert_eq!(tables, vec![("items".into(),), ("sqlite_sequence".into(),)]);
+        conn.execute("INSERT INTO items VALUES(100, 'deleted')")
+            .unwrap();
+        conn.execute("DELETE FROM items").unwrap();
+        conn.execute("INSERT INTO items(v) VALUES('first')")
+            .unwrap();
+        let ids: Vec<(i64,)> = conn.exec_rows("SELECT id FROM items");
+        assert_eq!(ids, vec![(101,)]);
+        let seq: Vec<(i64,)> = conn.exec_rows("SELECT seq FROM sqlite_sequence WHERE name='items'");
+        assert_eq!(seq, vec![(101,)]);
+    }
+    let db = open_db(&db_path);
+    let conn = db.connect().unwrap();
+    conn.execute("INSERT INTO items(v) VALUES('reopened')")
+        .unwrap();
+    conn.execute("ALTER TABLE items RENAME TO renamed").unwrap();
+    conn.execute("ALTER TABLE renamed ADD COLUMN note TEXT")
+        .unwrap();
+    conn.execute("ALTER TABLE renamed DROP COLUMN note")
+        .unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id,v FROM renamed ORDER BY id");
+    assert_eq!(rows, vec![(101, "first".into()), (102, "reopened".into())]);
+    let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name,seq FROM sqlite_sequence");
+    assert_eq!(seq, vec![("renamed".into(), 102)]);
+    conn.execute("DROP TABLE renamed").unwrap();
+    let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name,seq FROM sqlite_sequence");
+    assert!(seq.is_empty());
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".into(),)]);
+}
+
+#[test]
+fn test_autoincrement_wal_existing_backing_drop_and_alter() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("existing.db");
+    create_wal_autoincrement_with_backing(&db_path);
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect().unwrap();
+        let count: Vec<(i64,)> = conn.exec_rows(
+            "SELECT count(*) FROM sqlite_master WHERE name='__turso_internal_seq___turso_internal_autoincrement_items'",
+        );
+        assert_eq!(count, vec![(1,)]);
+        conn.execute("BEGIN DEFERRED").unwrap();
+        conn.execute("DROP TABLE __turso_internal_seq___turso_internal_autoincrement_items")
+            .unwrap();
+        conn.execute("ALTER TABLE items ADD COLUMN note TEXT")
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        let columns: Vec<(String,)> =
+            conn.exec_rows("SELECT name FROM pragma_table_info('items') ORDER BY cid");
+        assert_eq!(
+            columns,
+            vec![("id".into(),), ("v".into(),), ("note".into(),)]
+        );
+        conn.execute("INSERT INTO items(v) VALUES('next')").unwrap();
+        let seq: Vec<(i64,)> = conn.exec_rows("SELECT seq FROM sqlite_sequence WHERE name='items'");
+        assert_eq!(seq, vec![(101,)]);
+        conn.execute("CREATE SEQUENCE kept").unwrap();
+        assert!(conn
+            .execute("DROP TABLE __turso_internal_seq_kept")
+            .is_err());
+        assert!(conn.execute("DROP TABLE sqlite_sequence").is_err());
+    }
+    let db = open_db(&db_path);
+    let conn = db.connect().unwrap();
+    conn.execute("ALTER TABLE items RENAME TO renamed").unwrap();
+    conn.execute("INSERT INTO renamed(v) VALUES('reopened')")
+        .unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id,v FROM renamed ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            (1, "kept".into()),
+            (101, "next".into()),
+            (102, "reopened".into())
+        ]
+    );
+    let count: Vec<(i64,)> = conn.exec_rows(
+        "SELECT count(*) FROM sqlite_master WHERE name GLOB '__turso_internal_seq___turso_internal_autoincrement_*'",
+    );
+    assert_eq!(count, vec![(0,)]);
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".into(),)]);
+}
+
+#[test]
+fn test_autoincrement_wal_existing_backing_drop_rollback() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("rollback.db");
+    create_wal_autoincrement_with_backing(&db_path);
+    let db = open_db(&db_path);
+    let conn = db.connect().unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DROP TABLE __turso_internal_seq___turso_internal_autoincrement_items")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    let count: Vec<(i64,)> = conn.exec_rows(
+        "SELECT count(*) FROM sqlite_master WHERE name='__turso_internal_seq___turso_internal_autoincrement_items'",
+    );
+    assert_eq!(count, vec![(1,)]);
+    conn.execute("DROP TABLE __turso_internal_seq___turso_internal_autoincrement_items")
+        .unwrap();
+    conn.execute("INSERT INTO items(v) VALUES('next')").unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id,v FROM items ORDER BY id");
+    assert_eq!(rows, vec![(1, "kept".into()), (101, "next".into())]);
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".into(),)]);
+}
+
+fn create_wal_autoincrement_with_backing(db_path: &Path) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.pragma_update(None, "journal_mode", "wal").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE items(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+         INSERT INTO items VALUES(1, 'kept'), (100, 'deleted');
+         DELETE FROM items WHERE id=100;
+         CREATE TABLE __turso_internal_seq___turso_internal_autoincrement_items(
+             value INTEGER PRIMARY KEY, is_called INTEGER, start INTEGER, inc INTEGER,
+             min INTEGER, max INTEGER, cycle INTEGER);
+         INSERT INTO __turso_internal_seq___turso_internal_autoincrement_items
+             VALUES(1, 0, 1, 1, 1, 9223372036854775807, 0);",
+    )
+    .unwrap();
+}
+
 fn open_db(db_path: &Path) -> Arc<Database> {
     let io = Arc::new(turso_core::PlatformIO::new().unwrap());
     Database::open_file_with_flags(
